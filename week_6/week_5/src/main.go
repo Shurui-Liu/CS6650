@@ -5,15 +5,21 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/mux"
 )
 
-// Product represents the product schema from OpenAPI spec
+// KEEP YOUR EXISTING PRODUCT STRUCTURE
+// (or update if needed for search requirements)
 type Product struct {
-	ProductID    int    `json:"product_id"`
+	ID           int    `json:"id"`
+	Name         string `json:"name"`
+	Category     string `json:"category"`
+	Description  string `json:"description"`
+	Brand        string `json:"brand"`
 	SKU          string `json:"sku"`
 	Manufacturer string `json:"manufacturer"`
 	CategoryID   int    `json:"category_id"`
@@ -21,181 +27,130 @@ type Product struct {
 	SomeOtherID  int    `json:"some_other_id"`
 }
 
-// Error represents the error response schema
-type ErrorResponse struct {
-	Error   string `json:"error"`
-	Message string `json:"message"`
-	Details string `json:"details,omitempty"`
+// NEW: Search response structure
+type SearchResponse struct {
+	Products   []Product `json:"products"`
+	TotalFound int       `json:"total_found"`
+	SearchTime string    `json:"search_time"`
+	Checked    int       `json:"checked"` // For verification
 }
 
-// In-memory storage with mutex for thread safety
+// NEW: Store with 100,000 products
 type ProductStore struct {
-	sync.RWMutex
-	products map[int]Product
+	products []Product
+	mu       sync.RWMutex
 }
 
-var store = &ProductStore{
-	products: make(map[int]Product),
+var store *ProductStore
+
+// NEW: Generate 100,000 products at startup
+func init() {
+	store = &ProductStore{
+		products: make([]Product, 100000),
+	}
+
+	log.Println("Generating 100,000 products...")
+
+	brands := []string{"Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta", "Eta", "Theta"}
+	categories := []string{"Electronics", "Books", "Home", "Clothing", "Sports", "Toys", "Food", "Garden"}
+
+	for i := 0; i < 100000; i++ {
+		store.products[i] = Product{
+			ID:          i + 1,
+			Name:        fmt.Sprintf("Product %s %d", brands[i%len(brands)], i+1),
+			Category:    categories[i%len(categories)],
+			Description: fmt.Sprintf("Description for product %d", i+1),
+			Brand:       brands[i%len(brands)],
+			// Keep fields from previous assignment if needed
+			SKU:          fmt.Sprintf("SKU-%d", i+1),
+			Manufacturer: brands[i%len(brands)],
+			CategoryID:   (i % len(categories)) + 1,
+			Weight:       100 + (i % 1000),
+			SomeOtherID:  1000 + i,
+		}
+	}
+
+	log.Println("✓ Generated 100,000 products")
 }
 
-// Validation functions
-func validateProduct(p Product) *ErrorResponse {
-	if p.ProductID < 1 {
-		return &ErrorResponse{
-			Error:   "INVALID_INPUT",
-			Message: "Invalid product data",
-			Details: "product_id must be a positive integer",
-		}
-	}
-	if len(p.SKU) == 0 || len(p.SKU) > 100 {
-		return &ErrorResponse{
-			Error:   "INVALID_INPUT",
-			Message: "Invalid product data",
-			Details: "sku must be between 1 and 100 characters",
-		}
-	}
-	if len(p.Manufacturer) == 0 || len(p.Manufacturer) > 200 {
-		return &ErrorResponse{
-			Error:   "INVALID_INPUT",
-			Message: "Invalid product data",
-			Details: "manufacturer must be between 1 and 200 characters",
-		}
-	}
-	if p.CategoryID < 1 {
-		return &ErrorResponse{
-			Error:   "INVALID_INPUT",
-			Message: "Invalid product data",
-			Details: "category_id must be a positive integer",
-		}
-	}
-	if p.Weight < 0 {
-		return &ErrorResponse{
-			Error:   "INVALID_INPUT",
-			Message: "Invalid product data",
-			Details: "weight must be non-negative",
-		}
-	}
-	if p.SomeOtherID < 1 {
-		return &ErrorResponse{
-			Error:   "INVALID_INPUT",
-			Message: "Invalid product data",
-			Details: "some_other_id must be a positive integer",
-		}
-	}
-	return nil
-}
+// NEW: Search endpoint - checks exactly 100 products
+func handleSearch(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	query := r.URL.Query().Get("q")
 
-// GET /products/{productId}
-func getProduct(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	productID, err := strconv.Atoi(vars["productId"])
-
-	if err != nil || productID < 1 {
+	if query == "" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error:   "INVALID_INPUT",
-			Message: "Invalid product ID",
-			Details: "Product ID must be a positive integer",
-		})
+		json.NewEncoder(w).Encode(map[string]string{"error": "Query parameter 'q' is required"})
 		return
 	}
 
-	store.RLock()
-	product, exists := store.products[productID]
-	store.RUnlock()
+	query = strings.ToLower(query)
+	var results []Product
+	checked := 0
+	const maxCheck = 100 // CRITICAL: Only check 100 products
+	const maxResults = 20
 
-	if !exists {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error:   "NOT_FOUND",
-			Message: "Product not found",
-			Details: fmt.Sprintf("Product with ID %d does not exist", productID),
-		})
-		return
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+
+	// Check exactly 100 products
+	for i := 0; i < len(store.products) && checked < maxCheck; i++ {
+		checked++
+		product := store.products[i]
+
+		// Search in name and category (case-insensitive)
+		if strings.Contains(strings.ToLower(product.Name), query) ||
+			strings.Contains(strings.ToLower(product.Category), query) {
+			if len(results) < maxResults {
+				results = append(results, product)
+			}
+		}
+	}
+
+	searchTime := time.Since(start)
+
+	response := SearchResponse{
+		Products:   results,
+		TotalFound: len(results),
+		SearchTime: fmt.Sprintf("%.3fms", float64(searchTime.Microseconds())/1000.0),
+		Checked:    checked,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(product)
+	json.NewEncoder(w).Encode(response)
 }
 
-// POST /products/{productId}/details
-func addProductDetails(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	productID, err := strconv.Atoi(vars["productId"])
-
-	if err != nil || productID < 1 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error:   "INVALID_INPUT",
-			Message: "Invalid product ID",
-			Details: "Product ID must be a positive integer",
-		})
-		return
-	}
-
-	var product Product
-	err = json.NewDecoder(r.Body).Decode(&product)
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error:   "INVALID_INPUT",
-			Message: "Invalid JSON body",
-			Details: err.Error(),
-		})
-		return
-	}
-
-	// Validate that product_id in body matches URL parameter
-	if product.ProductID != productID {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error:   "INVALID_INPUT",
-			Message: "Product ID mismatch",
-			Details: "Product ID in URL must match product_id in request body",
-		})
-		return
-	}
-
-	// Validate product fields
-	if validationErr := validateProduct(product); validationErr != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(validationErr)
-		return
-	}
-
-	// Store the product
-	store.Lock()
-	store.products[productID] = product
-	store.Unlock()
-
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// Health check endpoint
+// KEEP YOUR EXISTING health check
 func healthCheck(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "healthy"})
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":         "healthy",
+		"total_products": len(store.products),
+	})
 }
+
+// KEEP YOUR EXISTING product endpoints if you want
+// (GET /products/{id} and POST /products/{id}/details)
+// ... your existing handlers ...
 
 func main() {
 	r := mux.NewRouter()
 
-	// Product endpoints
-	r.HandleFunc("/products/{productId}", getProduct).Methods("GET")
-	r.HandleFunc("/products/{productId}/details", addProductDetails).Methods("POST")
-
-	// Health check
+	// KEEP existing endpoints
 	r.HandleFunc("/health", healthCheck).Methods("GET")
+
+	// NEW: Add search endpoint
+	r.HandleFunc("/products/search", handleSearch).Methods("GET")
+
+	// KEEP your existing product endpoints if you have them
+	// r.HandleFunc("/products/{productId}", getProduct).Methods("GET")
+	// r.HandleFunc("/products/{productId}/details", addProductDetails).Methods("POST")
 
 	port := "8080"
 	log.Printf("Server starting on port %s", port)
+	log.Printf("Total products loaded: %d", len(store.products))
 	log.Fatal(http.ListenAndServe(":"+port, r))
 }
