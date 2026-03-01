@@ -1,0 +1,31 @@
+version: "3.9"
+
+services:
+
+  # ── Product search service (the one that breaks) ───────────────────────────
+  search-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - ENRICHMENT_HOST=http://dependent-service:9090
+    depends_on:
+      - dependent-service
+    networks:
+      - demo-net
+
+
+  dependent-service:      
+    build:
+      context: ./dependent-service  
+      dockerfile: Dockerfile
+    ports:
+      - "9090:9090"   # exposed so you can curl it from your laptop
+    networks:
+      - demo-net
+
+networks:
+  demo-net:
+    driver: bridge
