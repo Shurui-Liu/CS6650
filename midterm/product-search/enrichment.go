@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 )
 
 // enrichmentURL reads the chaos service address from an env var so it works
@@ -31,8 +32,8 @@ type enrichmentResponse struct {
 func enrichProduct(p Product) Product {
 	url := fmt.Sprintf("%s/enrich/%d", enrichmentURL(), p.ID)
 
-	// ⚠️  No timeout set on this client — uses Go's default (forever)
-	resp, err := http.Get(url) //nolint:gosec
+	client := &http.Client{Timeout: 200 * time.Millisecond}
+	resp, err := client.Get(url) //nolint:gosec
 	if err != nil {
 		log.Printf("enrichment failed for product %d: %v", p.ID, err)
 		return p // silently return unenriched product
