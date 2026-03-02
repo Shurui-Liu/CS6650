@@ -109,8 +109,17 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
+	state := CircuitState()
+	status := "ok"
+	if state != "closed" {
+		status = "degraded"
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":             status,
+		"enrichment_circuit": state,
+		"search":             "operational",
+	})
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
