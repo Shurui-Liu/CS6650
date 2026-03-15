@@ -45,7 +45,7 @@ type Product struct {
 	SomeOtherID  int    `json:"some_other_id"`
 }
 
-// NEW: Search response structure
+// Search response structure
 type SearchResponse struct {
 	Products   []Product `json:"products"`
 	TotalFound int       `json:"total_found"`
@@ -53,7 +53,7 @@ type SearchResponse struct {
 	Checked    int       `json:"checked"` // For verification
 }
 
-// NEW: Store with 100,000 products
+// Store with 100,000 products
 type ProductStore struct {
 	products []Product
 	mu       sync.RWMutex
