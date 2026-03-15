@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,6 +13,23 @@ import (
 
 	"github.com/gorilla/mux"
 )
+
+// Item represents a line item in an order
+type Item struct {
+	ProductID int     `json:"product_id"`
+	Name      string  `json:"name"`
+	Quantity  int     `json:"quantity"`
+	Price     float64 `json:"price"`
+}
+
+// Order represents an e-commerce order (pending, processing, completed)
+type Order struct {
+	OrderID    string    `json:"order_id"`
+	CustomerID int       `json:"customer_id"`
+	Status     string    `json:"status"`
+	Items      []Item    `json:"items"`
+	CreatedAt  time.Time `json:"created_at"`
+}
 
 // KEEP YOUR EXISTING PRODUCT STRUCTURE
 // (or update if needed for search requirements)
@@ -43,6 +62,15 @@ type ProductStore struct {
 
 var store *ProductStore
 
+// Payment verification bottleneck: buffered channel as semaphore.
+// Capacity 15 = at most 15 orders in verification; each takes 3s → 15/3 = 5 orders/sec.
+const (
+	paymentVerifyDuration = 3 * time.Second
+	ordersPerSecond       = 5
+	paymentSlotsCapacity  = 15 // 5 orders/sec * 3 sec per order
+)
+var paymentSlots chan struct{}
+
 // NEW: Generate 100,000 products at startup
 func init() {
 	store = &ProductStore{
@@ -71,6 +99,14 @@ func init() {
 	}
 
 	log.Println("✓ Generated 100,000 products")
+
+	// Payment verification semaphore: limits concurrent verifications so we get real backpressure
+	paymentSlots = make(chan struct{}, paymentSlotsCapacity)
+	for i := 0; i < paymentSlotsCapacity; i++ {
+		paymentSlots <- struct{}{}
+	}
+	log.Printf("✓ Payment verification bottleneck: %d slots, %v each → ~%d orders/sec\n",
+		paymentSlotsCapacity, paymentVerifyDuration, ordersPerSecond)
 }
 
 // NEW: Search endpoint - checks exactly 100 products
@@ -122,6 +158,51 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+// handleOrdersSync processes an order synchronously: acquires a payment slot, verifies (3s), returns.
+// The buffered channel ensures real backpressure—only 15 verifications can run at once.
+func handleOrdersSync(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(map[string]string{"error": "method not allowed"})
+		return
+	}
+
+	var order Order
+	if err := json.NewDecoder(r.Body).Decode(&order); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON body"})
+		return
+	}
+
+	if order.OrderID == "" {
+		b := make([]byte, 8)
+		if _, err := rand.Read(b); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		order.OrderID = "ord-" + hex.EncodeToString(b)
+	}
+	if order.CreatedAt.IsZero() {
+		order.CreatedAt = time.Now()
+	}
+	order.Status = "processing"
+
+	// Acquire a payment slot (blocks if all 15 are in use — real bottleneck)
+	<-paymentSlots
+	defer func() { paymentSlots <- struct{}{} }()
+
+	// Simulate payment verification: 3 second delay (thread is blocked for this request)
+	time.Sleep(paymentVerifyDuration)
+
+	order.Status = "completed"
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(order)
+}
+
 // KEEP YOUR EXISTING health check
 func healthCheck(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -144,6 +225,9 @@ func main() {
 
 	// NEW: Add search endpoint
 	r.HandleFunc("/products/search", handleSearch).Methods("GET")
+
+	// Phase 1: Synchronous order processing (payment verification 3s, ~5 orders/sec via semaphore)
+	r.HandleFunc("/orders/sync", handleOrdersSync).Methods("POST")
 
 	// KEEP your existing product endpoints if you have them
 	// r.HandleFunc("/products/{productId}", getProduct).Methods("GET")
