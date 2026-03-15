@@ -69,6 +69,7 @@ const (
 	ordersPerSecond       = 5
 	paymentSlotsCapacity  = 15 // 5 orders/sec * 3 sec per order
 )
+
 var paymentSlots chan struct{}
 
 // NEW: Generate 100,000 products at startup
