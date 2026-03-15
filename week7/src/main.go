@@ -31,7 +31,6 @@ type Order struct {
 	CreatedAt  time.Time `json:"created_at"`
 }
 
-// KEEP YOUR EXISTING PRODUCT STRUCTURE
 // (or update if needed for search requirements)
 type Product struct {
 	ID           int    `json:"id"`
