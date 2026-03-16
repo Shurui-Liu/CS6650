@@ -355,6 +355,7 @@ resource "aws_ecs_task_definition" "processor" {
       environment = [
         { name = "AWS_REGION",    value = var.aws_region },
         { name = "SQS_QUEUE_URL", value = aws_sqs_queue.orders.url }
+        { name = "WORKER_COUNT",  value = "5" }
       ]
     }
   ])
