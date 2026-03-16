@@ -1,0 +1,14 @@
+# Build for Linux (Lambda runs on Linux)
+$env:GOOS = "linux"
+$env:GOARCH = "amd64"
+$env:CGO_ENABLED = "0"
+
+go build -o bootstrap .
+
+# Zip it (Lambda needs a zip)
+Compress-Archive -Path bootstrap -DestinationPath function.zip -Force
+
+# Reset env
+Remove-Item Env:GOOS
+Remove-Item Env:GOARCH
+Remove-Item Env:CGO_ENABLED
