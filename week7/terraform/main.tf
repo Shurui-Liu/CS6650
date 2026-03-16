@@ -1,21 +1,15 @@
-# terraform/main.tf
-# Main configuration for Product API infrastructure
-
 # ==========================================
 # Data Sources
 # ==========================================
 
-# Reference existing LabRole
 data "aws_iam_role" "lab_role" {
   name = "LabRole"
 }
 
-# Get default VPC
 data "aws_vpc" "default" {
   default = true
 }
 
-# Get default subnets
 data "aws_subnets" "default" {
   filter {
     name   = "vpc-id"
@@ -24,9 +18,10 @@ data "aws_subnets" "default" {
 }
 
 # ==========================================
-# ECR Repository - Stores Docker Images
+# ECR Repositories
 # ==========================================
 
+# Receiver (existing API)
 resource "aws_ecr_repository" "app" {
   name                 = var.ecr_repository_name
   image_tag_mutability = "MUTABLE"
@@ -42,11 +37,24 @@ resource "aws_ecr_repository" "app" {
   }
 }
 
+# Processor (new)
+resource "aws_ecr_repository" "processor" {
+  name                 = "order-processor"
+  image_tag_mutability = "MUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+
+  tags = {
+    Name = "order-processor"
+  }
+}
+
 # ==========================================
-# VPC and Networking
+# Security Groups
 # ==========================================
 
-# Security Group for ALB
 resource "aws_security_group" "alb" {
   name        = "${var.service_name}-alb-sg"
   description = "Security group for Application Load Balancer"
@@ -61,7 +69,6 @@ resource "aws_security_group" "alb" {
   }
 
   egress {
-    description = "All outbound traffic"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
@@ -73,7 +80,6 @@ resource "aws_security_group" "alb" {
   }
 }
 
-# Security Group for ECS Tasks
 resource "aws_security_group" "ecs_tasks" {
   name        = "${var.service_name}-ecs-tasks-sg"
   description = "Security group for ECS tasks"
@@ -88,7 +94,6 @@ resource "aws_security_group" "ecs_tasks" {
   }
 
   egress {
-    description = "All outbound traffic"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
@@ -153,7 +158,7 @@ resource "aws_lb_listener" "app" {
 }
 
 # ==========================================
-# CloudWatch Logs
+# CloudWatch Log Groups
 # ==========================================
 
 resource "aws_cloudwatch_log_group" "app" {
@@ -163,6 +168,11 @@ resource "aws_cloudwatch_log_group" "app" {
   tags = {
     Name = "${var.service_name}-logs"
   }
+}
+
+resource "aws_cloudwatch_log_group" "processor" {
+  name              = "/ecs/order-processor"
+  retention_in_days = var.log_retention_days
 }
 
 # ==========================================
@@ -178,11 +188,61 @@ resource "aws_ecs_cluster" "main" {
 }
 
 # ==========================================
-# ECS Task Definition
+# SNS + SQS
 # ==========================================
 
-resource "aws_ecs_task_definition" "app" {
-  family                   = var.service_name
+resource "aws_sns_topic" "orders" {
+  name = "order-processing-events"
+
+  tags = {
+    Name = "order-processing-events"
+  }
+}
+
+resource "aws_sqs_queue" "orders" {
+  name                       = "order-processing-queue"
+  visibility_timeout_seconds = 30
+  message_retention_seconds  = 345600 # 4 days
+  receive_wait_time_seconds  = 20     # long polling
+
+  tags = {
+    Name = "order-processing-queue"
+  }
+}
+
+resource "aws_sqs_queue_policy" "orders" {
+  queue_url = aws_sqs_queue.orders.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect    = "Allow"
+        Principal = { Service = "sns.amazonaws.com" }
+        Action    = "sqs:SendMessage"
+        Resource  = aws_sqs_queue.orders.arn
+        Condition = {
+          ArnEquals = {
+            "aws:SourceArn" = aws_sns_topic.orders.arn
+          }
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_sns_topic_subscription" "orders" {
+  topic_arn = aws_sns_topic.orders.arn
+  protocol  = "sqs"
+  endpoint  = aws_sqs_queue.orders.arn
+}
+
+# ==========================================
+# ECS Task Definition — receiver (API)
+# ==========================================
+
+resource "aws_ecs_task_definition" "receiver" {
+  family                   = "order-receiver"
   network_mode             = "awsvpc"
   requires_compatibilities = ["FARGATE"]
   cpu                      = var.container_cpu
@@ -204,6 +264,14 @@ resource "aws_ecs_task_definition" "app" {
         }
       ]
 
+      healthCheck = {
+        command     = ["CMD-SHELL", "curl -f http://localhost:${var.container_port}/health || exit 1"]
+        interval    = 30
+        timeout     = 5
+        retries     = 2
+        startPeriod = 60
+      }
+
       logConfiguration = {
         logDriver = "awslogs"
         options = {
@@ -214,28 +282,27 @@ resource "aws_ecs_task_definition" "app" {
       }
 
       environment = [
-        {
-          name  = "PORT"
-          value = tostring(var.container_port)
-        }
+        { name = "PORT",          value = tostring(var.container_port) },
+        { name = "AWS_REGION",    value = var.aws_region },
+        { name = "SNS_TOPIC_ARN", value = aws_sns_topic.orders.arn }
       ]
     }
   ])
 
   tags = {
-    Name = "${var.service_name}-task"
+    Name = "order-receiver-task"
   }
 }
 
 # ==========================================
-# ECS Service
+# ECS Service — receiver (behind ALB)
 # ==========================================
 
-resource "aws_ecs_service" "main" {
-  name            = var.service_name
+resource "aws_ecs_service" "receiver" {
+  name            = "order-receiver"
   cluster         = aws_ecs_cluster.main.id
-  task_definition = aws_ecs_task_definition.app.arn
-  desired_count   = var.ecs_count
+  task_definition = aws_ecs_task_definition.receiver.arn
+  desired_count   = 1
   launch_type     = "FARGATE"
 
   network_configuration {
@@ -250,11 +317,138 @@ resource "aws_ecs_service" "main" {
     container_port   = var.container_port
   }
 
-  depends_on = [
-    aws_lb_listener.app
-  ]
+  depends_on = [aws_lb_listener.app]
 
   tags = {
-    Name = "${var.service_name}-service"
+    Name = "order-receiver-service"
   }
+}
+
+# ==========================================
+# ECS Task Definition — processor
+# ==========================================
+
+resource "aws_ecs_task_definition" "processor" {
+  family                   = "order-processor"
+  network_mode             = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  cpu                      = var.container_cpu
+  memory                   = var.container_memory
+  execution_role_arn       = data.aws_iam_role.lab_role.arn
+  task_role_arn            = data.aws_iam_role.lab_role.arn
+
+  container_definitions = jsonencode([
+    {
+      name      = "order-processor-container"
+      image     = "${aws_ecr_repository.processor.repository_url}:latest"
+      essential = true
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.processor.name
+          "awslogs-region"        = var.aws_region
+          "awslogs-stream-prefix" = "ecs"
+        }
+      }
+
+      environment = [
+        { name = "AWS_REGION",    value = var.aws_region },
+        { name = "SQS_QUEUE_URL", value = aws_sqs_queue.orders.url },
+        { name = "WORKER_COUNT",  value = "5" }
+      ]
+    }
+  ])
+
+  tags = {
+    Name = "order-processor-task"
+  }
+}
+
+# ==========================================
+# ECS Service — processor (no ALB)
+# ==========================================
+
+resource "aws_ecs_service" "processor" {
+  name            = "order-processor"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.processor.arn
+  desired_count   = 1
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    security_groups  = [aws_security_group.ecs_tasks.id]
+    subnets          = data.aws_subnets.default.ids
+    assign_public_ip = true
+  }
+
+  tags = {
+    Name = "order-processor-service"
+  }
+}
+
+# ==========================================
+# Lambda Function — order-processor-lambda
+# ==========================================
+
+resource "aws_lambda_function" "order_processor" {
+  function_name = "order-processor-lambda"
+  role          = data.aws_iam_role.lab_role.arn
+  runtime       = "provided.al2"
+  handler       = "bootstrap"
+  filename      = "../lambda/function.zip"
+
+  memory_size = 512
+  timeout     = 30 # must be > 3s payment delay
+
+  source_code_hash = filebase64sha256("../lambda/function.zip")
+
+  environment {
+    variables = {
+      AWS_REGION_NAME = var.aws_region
+    }
+  }
+
+  tags = {
+    Name = "order-processor-lambda"
+  }
+}
+
+# ==========================================
+# Allow SNS to invoke Lambda
+# ==========================================
+
+resource "aws_lambda_permission" "sns_invoke" {
+  statement_id  = "AllowSNSInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.order_processor.function_name
+  principal     = "sns.amazonaws.com"
+  source_arn    = aws_sns_topic.orders.arn
+}
+
+# ==========================================
+# Subscribe Lambda directly to SNS topic
+# ==========================================
+
+resource "aws_sns_topic_subscription" "lambda_sub" {
+  topic_arn = aws_sns_topic.orders.arn
+  protocol  = "lambda"
+  endpoint  = aws_lambda_function.order_processor.arn
+}
+
+# ==========================================
+# CloudWatch log group for Lambda
+# ==========================================
+
+resource "aws_cloudwatch_log_group" "lambda" {
+  name              = "/aws/lambda/order-processor-lambda"
+  retention_in_days = var.log_retention_days
+}
+
+# ==========================================
+# Output
+# ==========================================
+
+output "lambda_function_name" {
+  value = aws_lambda_function.order_processor.function_name
 }

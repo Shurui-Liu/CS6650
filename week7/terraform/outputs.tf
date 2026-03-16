@@ -18,7 +18,7 @@ output "ecs_cluster_name" {
 
 output "ecs_service_name" {
   description = "Name of the ECS service"
-  value       = aws_ecs_service.main.name
+  value = aws_ecs_service.receiver.name
 }
 
 output "aws_region" {
