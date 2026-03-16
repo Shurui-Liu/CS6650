@@ -71,7 +71,6 @@ const (
 
 var paymentSlots chan struct{}
 
-// NEW: Generate 100,000 products at startup
 func init() {
 	store = &ProductStore{
 		products: make([]Product, 100000),
