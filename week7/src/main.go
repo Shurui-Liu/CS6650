@@ -74,7 +74,6 @@ const (
 
 var paymentSlots chan struct{}
 
-// AWS clients (initialised in main)
 var snsClient *sns.Client
 var sqsClient *sqs.Client
 var snsTopicARN string
@@ -89,11 +88,16 @@ func init() {
 	categories := []string{"Electronics", "Books", "Home", "Clothing", "Sports", "Toys", "Food", "Garden"}
 	for i := 0; i < 100000; i++ {
 		store.products[i] = Product{
-			ID: i + 1, Name: fmt.Sprintf("Product %s %d", brands[i%len(brands)], i+1),
-			Category: categories[i%len(categories)], Description: fmt.Sprintf("Description for product %d", i+1),
-			Brand: brands[i%len(brands)], SKU: fmt.Sprintf("SKU-%d", i+1),
-			Manufacturer: brands[i%len(brands)], CategoryID: (i % len(categories)) + 1,
-			Weight: 100 + (i % 1000), SomeOtherID: 1000 + i,
+			ID:           i + 1,
+			Name:         fmt.Sprintf("Product %s %d", brands[i%len(brands)], i+1),
+			Category:     categories[i%len(categories)],
+			Description:  fmt.Sprintf("Description for product %d", i+1),
+			Brand:        brands[i%len(brands)],
+			SKU:          fmt.Sprintf("SKU-%d", i+1),
+			Manufacturer: brands[i%len(brands)],
+			CategoryID:   (i % len(categories)) + 1,
+			Weight:       100 + (i % 1000),
+			SomeOtherID:  1000 + i,
 		}
 	}
 	log.Println("✓ Generated 100,000 products")
@@ -118,6 +122,13 @@ func verifyPayment() {
 	<-paymentSlots
 	defer func() { paymentSlots <- struct{}{} }()
 	time.Sleep(paymentVerifyDuration)
+}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
 
 // ── Handlers ───────────────────────────────────────────────────────────────────
@@ -154,7 +165,8 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(SearchResponse{
-		Products: results, TotalFound: len(results),
+		Products:   results,
+		TotalFound: len(results),
 		SearchTime: fmt.Sprintf("%.3fms", float64(time.Since(start).Microseconds())/1000.0),
 		Checked:    checked,
 	})
@@ -195,7 +207,6 @@ func handleOrdersAsync(w http.ResponseWriter, r *http.Request) {
 	order.CreatedAt = time.Now()
 	order.Status = "pending"
 
-	// Serialize and publish to SNS
 	body, err := json.Marshal(order)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -213,7 +224,6 @@ func handleOrdersAsync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Return 202 immediately — customer is NOT waiting for payment
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]string{
@@ -223,8 +233,7 @@ func handleOrdersAsync(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ── SQS Processor (runs in background goroutine) ───────────────────────────────
-// Continuously polls SQS, spawns a goroutine per message to simulate payment.
+// ── SQS Processor (optional background goroutine) ─────────────────────────────
 
 func startOrderProcessor() {
 	log.Println("✓ Order processor started — polling SQS...")
@@ -232,14 +241,13 @@ func startOrderProcessor() {
 		out, err := sqsClient.ReceiveMessage(context.Background(), &sqs.ReceiveMessageInput{
 			QueueUrl:            &sqsQueueURL,
 			MaxNumberOfMessages: 10,
-			WaitTimeSeconds:     20, // long polling
+			WaitTimeSeconds:     20,
 		})
 		if err != nil {
 			log.Printf("SQS receive error: %v", err)
 			time.Sleep(5 * time.Second)
 			continue
 		}
-
 		for _, msg := range out.Messages {
 			go processMessage(msg)
 		}
@@ -247,7 +255,6 @@ func startOrderProcessor() {
 }
 
 func processMessage(msg sqstypes.Message) {
-	// SQS wraps SNS messages — unwrap the SNS envelope
 	var snsEnvelope struct {
 		Message string `json:"Message"`
 	}
@@ -255,22 +262,15 @@ func processMessage(msg sqstypes.Message) {
 		log.Printf("Failed to parse SNS envelope: %v", err)
 		return
 	}
-
 	var order Order
 	if err := json.Unmarshal([]byte(snsEnvelope.Message), &order); err != nil {
 		log.Printf("Failed to parse order: %v", err)
 		return
 	}
-
 	log.Printf("Processing order %s for customer %d", order.OrderID, order.CustomerID)
-
-	// Simulate payment verification (3s) — but this is background, not blocking the customer
 	verifyPayment()
-
 	order.Status = "completed"
 	log.Printf("✓ Order %s completed", order.OrderID)
-
-	// Delete message from SQS after successful processing
 	sqsClient.DeleteMessage(context.Background(), &sqs.DeleteMessageInput{
 		QueueUrl:      &sqsQueueURL,
 		ReceiptHandle: msg.ReceiptHandle,
@@ -280,7 +280,6 @@ func processMessage(msg sqstypes.Message) {
 // ── Main ───────────────────────────────────────────────────────────────────────
 
 func main() {
-	// Load AWS config (uses ECS task role automatically)
 	cfg, err := config.LoadDefaultConfig(context.Background(),
 		config.WithRegion(getEnv("AWS_REGION", "us-west-2")),
 	)
@@ -293,27 +292,24 @@ func main() {
 	snsTopicARN = getEnv("SNS_TOPIC_ARN", "")
 	sqsQueueURL = getEnv("SQS_QUEUE_URL", "")
 
-	if snsTopicARN == "" || sqsQueueURL == "" {
-		log.Fatal("SNS_TOPIC_ARN and SQS_QUEUE_URL environment variables are required")
+	if snsTopicARN == "" {
+		log.Fatal("SNS_TOPIC_ARN environment variable is required")
 	}
 
-	// Start SQS polling in background
-	go startOrderProcessor()
+	// Only start SQS processor if queue URL is configured
+	if sqsQueueURL != "" {
+		go startOrderProcessor()
+	} else {
+		log.Println("SQS_QUEUE_URL not set — skipping local processor (using separate processor service)")
+	}
 
 	r := mux.NewRouter()
 	r.HandleFunc("/health", healthCheck).Methods("GET")
 	r.HandleFunc("/products/search", handleSearch).Methods("GET")
 	r.HandleFunc("/orders/sync", handleOrdersSync).Methods("POST")
-	r.HandleFunc("/orders/async", handleOrdersAsync).Methods("POST") // NEW
+	r.HandleFunc("/orders/async", handleOrdersAsync).Methods("POST")
 
 	port := getEnv("PORT", "8080")
 	log.Printf("Server starting on port %s", port)
 	log.Fatal(http.ListenAndServe(":"+port, r))
-}
-
-func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
 }
