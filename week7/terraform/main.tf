@@ -386,3 +386,69 @@ resource "aws_ecs_service" "processor" {
     Name = "order-processor-service"
   }
 }
+
+# ==========================================
+# Lambda Function — order-processor-lambda
+# ==========================================
+
+resource "aws_lambda_function" "order_processor" {
+  function_name = "order-processor-lambda"
+  role          = data.aws_iam_role.lab_role.arn
+  runtime       = "provided.al2"
+  handler       = "bootstrap"
+  filename      = "../lambda/function.zip"
+
+  memory_size = 512
+  timeout     = 30 # must be > 3s payment delay
+
+  source_code_hash = filebase64sha256("../lambda/function.zip")
+
+  environment {
+    variables = {
+      AWS_REGION_NAME = var.aws_region
+    }
+  }
+
+  tags = {
+    Name = "order-processor-lambda"
+  }
+}
+
+# ==========================================
+# Allow SNS to invoke Lambda
+# ==========================================
+
+resource "aws_lambda_permission" "sns_invoke" {
+  statement_id  = "AllowSNSInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.order_processor.function_name
+  principal     = "sns.amazonaws.com"
+  source_arn    = aws_sns_topic.orders.arn
+}
+
+# ==========================================
+# Subscribe Lambda directly to SNS topic
+# ==========================================
+
+resource "aws_sns_topic_subscription" "lambda_sub" {
+  topic_arn = aws_sns_topic.orders.arn
+  protocol  = "lambda"
+  endpoint  = aws_lambda_function.order_processor.arn
+}
+
+# ==========================================
+# CloudWatch log group for Lambda
+# ==========================================
+
+resource "aws_cloudwatch_log_group" "lambda" {
+  name              = "/aws/lambda/order-processor-lambda"
+  retention_in_days = var.log_retention_days
+}
+
+# ==========================================
+# Output
+# ==========================================
+
+output "lambda_function_name" {
+  value = aws_lambda_function.order_processor.function_name
+}
