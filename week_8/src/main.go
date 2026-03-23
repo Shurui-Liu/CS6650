@@ -15,7 +15,12 @@ import (
 	"sync"
 	"time"
 
+	"errors"
+
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
@@ -97,6 +102,9 @@ var snsTopicARN string
 var sqsQueueURL string
 
 var db *sql.DB
+
+var dynamoClient    *dynamodb.Client
+var dynamoCartTable string
 
 // ── Init ───────────────────────────────────────────────────────────────────────
 
@@ -460,6 +468,206 @@ func handleAddItem(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// ── DynamoDB Shopping Cart Handlers ───────────────────────────────────────────
+
+// POST /dynamo/shopping-carts
+func handleDynamoCreateCart(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		CustomerID int `json:"customer_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if req.CustomerID <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "customer_id is required"})
+		return
+	}
+
+	// UUID cart_id — random distribution across DynamoDB partitions
+	b := make([]byte, 16)
+	rand.Read(b)
+	cartID := fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+
+	now := time.Now().UTC()
+	ttl := now.Add(30 * 24 * time.Hour).Unix() // auto-expire after 30 days
+
+	_, err := dynamoClient.PutItem(r.Context(), &dynamodb.PutItemInput{
+		TableName: &dynamoCartTable,
+		Item: map[string]types.AttributeValue{
+			"cart_id":     &types.AttributeValueMemberS{Value: cartID},
+			"customer_id": &types.AttributeValueMemberN{Value: strconv.Itoa(req.CustomerID)},
+			"status":      &types.AttributeValueMemberS{Value: "active"},
+			"created_at":  &types.AttributeValueMemberS{Value: now.Format(time.RFC3339)},
+			"updated_at":  &types.AttributeValueMemberS{Value: now.Format(time.RFC3339)},
+			// Empty map — required so UpdateItem can SET items.#pid later
+			"items":       &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{}},
+			"ttl":         &types.AttributeValueMemberN{Value: strconv.FormatInt(ttl, 10)},
+		},
+	})
+	if err != nil {
+		log.Printf("dynamoCreateCart PutItem: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create cart"})
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		"cart_id":     cartID,
+		"customer_id": req.CustomerID,
+		"status":      "active",
+		"items":       []CartItem{},
+		"created_at":  now.Format(time.RFC3339),
+	})
+}
+
+// GET /dynamo/shopping-carts/{id}
+func handleDynamoGetCart(w http.ResponseWriter, r *http.Request) {
+	cartID := mux.Vars(r)["id"]
+	if cartID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "cart id is required"})
+		return
+	}
+
+	out, err := dynamoClient.GetItem(r.Context(), &dynamodb.GetItemInput{
+		TableName: &dynamoCartTable,
+		Key: map[string]types.AttributeValue{
+			"cart_id": &types.AttributeValueMemberS{Value: cartID},
+		},
+	})
+	if err != nil {
+		log.Printf("dynamoGetCart GetItem: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to retrieve cart"})
+		return
+	}
+	if out.Item == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "cart not found"})
+		return
+	}
+
+	// Parse scalar fields
+	var customerID int
+	var status, createdAt string
+	if v, ok := out.Item["customer_id"].(*types.AttributeValueMemberN); ok {
+		customerID, _ = strconv.Atoi(v.Value)
+	}
+	if v, ok := out.Item["status"].(*types.AttributeValueMemberS); ok {
+		status = v.Value
+	}
+	if v, ok := out.Item["created_at"].(*types.AttributeValueMemberS); ok {
+		createdAt = v.Value
+	}
+
+	// Parse items Map → []CartItem
+	var items []CartItem
+	if itemsAttr, ok := out.Item["items"].(*types.AttributeValueMemberM); ok {
+		for pidStr, av := range itemsAttr.Value {
+			m, ok := av.(*types.AttributeValueMemberM)
+			if !ok {
+				continue
+			}
+			var item CartItem
+			item.ProductID, _ = strconv.Atoi(pidStr)
+			if q, ok := m.Value["quantity"].(*types.AttributeValueMemberN); ok {
+				item.Quantity, _ = strconv.Atoi(q.Value)
+			}
+			if p, ok := m.Value["unit_price"].(*types.AttributeValueMemberN); ok {
+				item.UnitPrice, _ = strconv.ParseFloat(p.Value, 64)
+			}
+			items = append(items, item)
+		}
+	}
+	if items == nil {
+		items = []CartItem{}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"cart_id":     cartID,
+		"customer_id": customerID,
+		"status":      status,
+		"items":       items,
+		"created_at":  createdAt,
+	})
+}
+
+// POST /dynamo/shopping-carts/{id}/items
+func handleDynamoAddItem(w http.ResponseWriter, r *http.Request) {
+	cartID := mux.Vars(r)["id"]
+	if cartID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "cart id is required"})
+		return
+	}
+
+	var item CartItem
+	if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if item.ProductID <= 0 || item.Quantity <= 0 || item.UnitPrice < 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "product_id, quantity (>0), and unit_price (>=0) are required"})
+		return
+	}
+
+	pidStr := strconv.Itoa(item.ProductID)
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	// UpdateItem: SET items.#pid = :itemval, updated_at = :now
+	// ConditionExpression guards against writing to a non-existent or inactive cart.
+	// #s aliases "status" — DynamoDB reserved word protection.
+	_, err := dynamoClient.UpdateItem(r.Context(), &dynamodb.UpdateItemInput{
+		TableName: &dynamoCartTable,
+		Key: map[string]types.AttributeValue{
+			"cart_id": &types.AttributeValueMemberS{Value: cartID},
+		},
+		UpdateExpression:    strPtr("SET #items.#pid = :itemval, updated_at = :now"),
+		ConditionExpression: strPtr("attribute_exists(cart_id) AND #s = :active"),
+		ExpressionAttributeNames: map[string]string{
+			"#items": "items",
+			"#pid":   pidStr,
+			"#s":     "status",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":itemval": &types.AttributeValueMemberM{
+				Value: map[string]types.AttributeValue{
+					"quantity":   &types.AttributeValueMemberN{Value: strconv.Itoa(item.Quantity)},
+					"unit_price": &types.AttributeValueMemberN{Value: strconv.FormatFloat(item.UnitPrice, 'f', 2, 64)},
+				},
+			},
+			":now":    &types.AttributeValueMemberS{Value: now},
+			":active": &types.AttributeValueMemberS{Value: "active"},
+		},
+	})
+	if err != nil {
+		// ConditionalCheckFailedException: cart missing or not active
+		var condErr *types.ConditionalCheckFailedException
+		if errors.As(err, &condErr) {
+			// Distinguish 404 vs 409 with a cheap GetItem
+			out, getErr := dynamoClient.GetItem(r.Context(), &dynamodb.GetItemInput{
+				TableName: &dynamoCartTable,
+				Key: map[string]types.AttributeValue{
+					"cart_id": &types.AttributeValueMemberS{Value: cartID},
+				},
+			})
+			if getErr != nil || out.Item == nil {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "cart not found"})
+				return
+			}
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "cart is not active"})
+			return
+		}
+		log.Printf("dynamoAddItem UpdateItem: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to add item"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// strPtr is a helper since Go requires addressable strings for AWS SDK inputs
+func strPtr(s string) *string { return &s }
+
+// attributevalue is imported for potential future marshaling use
+var _ = attributevalue.Marshal
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -503,6 +711,11 @@ func main() {
 		log.Println("✓ Connected to MySQL")
 	}
 
+	// ── DynamoDB client ───────────────────────────────────────────────────────
+	dynamoClient    = dynamodb.NewFromConfig(cfg)
+	dynamoCartTable = getEnv("DYNAMODB_TABLE_CARTS", "shopping-carts")
+	log.Printf("✓ DynamoDB client ready (table: %s)", dynamoCartTable)
+
 	if snsTopicARN == "" {
 		log.Fatal("SNS_TOPIC_ARN environment variable is required")
 	}
@@ -522,6 +735,9 @@ func main() {
 	r.HandleFunc("/shopping-carts", handleCreateCart).Methods("POST")
 	r.HandleFunc("/shopping-carts/{id}", handleGetCart).Methods("GET")
 	r.HandleFunc("/shopping-carts/{id}/items", handleAddItem).Methods("POST")
+	r.HandleFunc("/dynamo/shopping-carts", handleDynamoCreateCart).Methods("POST")
+	r.HandleFunc("/dynamo/shopping-carts/{id}", handleDynamoGetCart).Methods("GET")
+	r.HandleFunc("/dynamo/shopping-carts/{id}/items", handleDynamoAddItem).Methods("POST")
 
 	port := getEnv("PORT", "8080")
 	log.Printf("Server starting on port %s", port)

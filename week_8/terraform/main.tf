@@ -282,14 +282,15 @@ resource "aws_ecs_task_definition" "receiver" {
       }
 
       environment = [
-        { name = "PORT",          value = tostring(var.container_port) },
-        { name = "AWS_REGION",    value = var.aws_region },
-        { name = "SNS_TOPIC_ARN", value = aws_sns_topic.orders.arn },
-        { name = "DB_HOST",       value = module.rds.host },
-        { name = "DB_PORT",       value = tostring(module.rds.port) },
-        { name = "DB_NAME",       value = module.rds.db_name },
-        { name = "DB_USER",       value = var.db_username },
-        { name = "DB_PASSWORD",   value = var.db_password }
+        { name = "PORT",                value = tostring(var.container_port) },
+        { name = "AWS_REGION",          value = var.aws_region },
+        { name = "SNS_TOPIC_ARN",       value = aws_sns_topic.orders.arn },
+        { name = "DB_HOST",             value = module.rds.host },
+        { name = "DB_PORT",             value = tostring(module.rds.port) },
+        { name = "DB_NAME",             value = module.rds.db_name },
+        { name = "DB_USER",             value = var.db_username },
+        { name = "DB_PASSWORD",         value = var.db_password },
+        { name = "DYNAMODB_TABLE_CARTS", value = aws_dynamodb_table.shopping_carts.name }
       ]
     }
   ])

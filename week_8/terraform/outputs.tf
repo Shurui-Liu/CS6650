@@ -50,3 +50,13 @@ output "rds_db_name" {
   description = "RDS initial database name"
   value       = module.rds.db_name
 }
+
+output "dynamodb_table_name" {
+  description = "DynamoDB shopping carts table name"
+  value       = aws_dynamodb_table.shopping_carts.name
+}
+
+output "dynamodb_table_arn" {
+  description = "DynamoDB shopping carts table ARN"
+  value       = aws_dynamodb_table.shopping_carts.arn
+}
