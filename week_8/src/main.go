@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
+	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/mux"
 )
 
@@ -50,6 +53,20 @@ type Product struct {
 	SomeOtherID  int    `json:"some_other_id"`
 }
 
+type Cart struct {
+	CartID     int64      `json:"cart_id"`
+	CustomerID int        `json:"customer_id"`
+	Status     string     `json:"status"`
+	Items      []CartItem `json:"items"`
+	CreatedAt  time.Time  `json:"created_at"`
+}
+
+type CartItem struct {
+	ProductID int     `json:"product_id"`
+	Quantity  int     `json:"quantity"`
+	UnitPrice float64 `json:"unit_price"`
+}
+
 type SearchResponse struct {
 	Products   []Product `json:"products"`
 	TotalFound int       `json:"total_found"`
@@ -78,6 +95,8 @@ var snsClient *sns.Client
 var sqsClient *sqs.Client
 var snsTopicARN string
 var sqsQueueURL string
+
+var db *sql.DB
 
 // ── Init ───────────────────────────────────────────────────────────────────────
 
@@ -277,9 +296,180 @@ func processMessage(msg sqstypes.Message) {
 	})
 }
 
+// ── Shopping Cart Handlers ─────────────────────────────────────────────────────
+
+// POST /shopping-carts
+func handleCreateCart(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		CustomerID int `json:"customer_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if req.CustomerID <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "customer_id is required"})
+		return
+	}
+
+	res, err := db.ExecContext(r.Context(),
+		"INSERT INTO carts (customer_id, status) VALUES (?, 'active')",
+		req.CustomerID,
+	)
+	if err != nil {
+		log.Printf("createCart: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create cart"})
+		return
+	}
+	cartID, _ := res.LastInsertId()
+
+	writeJSON(w, http.StatusCreated, Cart{
+		CartID:     cartID,
+		CustomerID: req.CustomerID,
+		Status:     "active",
+		Items:      []CartItem{},
+		CreatedAt:  time.Now(),
+	})
+}
+
+// GET /shopping-carts/{id}
+func handleGetCart(w http.ResponseWriter, r *http.Request) {
+	cartID, err := strconv.ParseInt(mux.Vars(r)["id"], 10, 64)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid cart id"})
+		return
+	}
+
+	var cart Cart
+	err = db.QueryRowContext(r.Context(),
+		"SELECT cart_id, customer_id, status, created_at FROM carts WHERE cart_id = ?",
+		cartID,
+	).Scan(&cart.CartID, &cart.CustomerID, &cart.Status, &cart.CreatedAt)
+	if err == sql.ErrNoRows {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "cart not found"})
+		return
+	}
+	if err != nil {
+		log.Printf("getCart: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to retrieve cart"})
+		return
+	}
+
+	rows, err := db.QueryContext(r.Context(),
+		"SELECT product_id, quantity, unit_price FROM cart_items WHERE cart_id = ?",
+		cartID,
+	)
+	if err != nil {
+		log.Printf("getCart items: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to retrieve cart items"})
+		return
+	}
+	defer rows.Close()
+
+	cart.Items = []CartItem{}
+	for rows.Next() {
+		var item CartItem
+		if err := rows.Scan(&item.ProductID, &item.Quantity, &item.UnitPrice); err != nil {
+			log.Printf("getCart scan: %v", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to read cart items"})
+			return
+		}
+		cart.Items = append(cart.Items, item)
+	}
+
+	writeJSON(w, http.StatusOK, cart)
+}
+
+// POST /shopping-carts/{id}/items
+func handleAddItem(w http.ResponseWriter, r *http.Request) {
+	cartID, err := strconv.ParseInt(mux.Vars(r)["id"], 10, 64)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid cart id"})
+		return
+	}
+
+	var item CartItem
+	if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if item.ProductID <= 0 || item.Quantity <= 0 || item.UnitPrice < 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "product_id, quantity (>0), and unit_price (>=0) are required"})
+		return
+	}
+
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		log.Printf("addItem begin tx: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to start transaction"})
+		return
+	}
+	defer tx.Rollback()
+
+	// Lock the cart row — serializes concurrent writes to the same cart
+	var status string
+	err = tx.QueryRowContext(r.Context(),
+		"SELECT status FROM carts WHERE cart_id = ? FOR UPDATE",
+		cartID,
+	).Scan(&status)
+	if err == sql.ErrNoRows {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "cart not found"})
+		return
+	}
+	if err != nil {
+		log.Printf("addItem lock: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to lock cart"})
+		return
+	}
+	if status != "active" {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "cart is not active"})
+		return
+	}
+
+	// Upsert: if product already in cart, add to quantity
+	_, err = tx.ExecContext(r.Context(), `
+		INSERT INTO cart_items (cart_id, product_id, quantity, unit_price)
+		VALUES (?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE
+			quantity   = quantity + VALUES(quantity),
+			unit_price = VALUES(unit_price)`,
+		cartID, item.ProductID, item.Quantity, item.UnitPrice,
+	)
+	if err != nil {
+		log.Printf("addItem upsert: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to add item"})
+		return
+	}
+
+	_, err = tx.ExecContext(r.Context(),
+		"UPDATE carts SET updated_at = NOW() WHERE cart_id = ?",
+		cartID,
+	)
+	if err != nil {
+		log.Printf("addItem update ts: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update cart"})
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		log.Printf("addItem commit: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to commit transaction"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
+}
+
 // ── Main ───────────────────────────────────────────────────────────────────────
 
 func main() {
+	var err error
 	cfg, err := config.LoadDefaultConfig(context.Background(),
 		config.WithRegion(getEnv("AWS_REGION", "us-west-2")),
 	)
@@ -291,6 +481,27 @@ func main() {
 	sqsClient = sqs.NewFromConfig(cfg)
 	snsTopicARN = getEnv("SNS_TOPIC_ARN", "")
 	sqsQueueURL = getEnv("SQS_QUEUE_URL", "")
+
+	// ── MySQL connection pool ──────────────────────────────────────────────────
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true",
+		getEnv("DB_USER", "admin"),
+		getEnv("DB_PASSWORD", ""),
+		getEnv("DB_HOST", "localhost"),
+		getEnv("DB_PORT", "3306"),
+		getEnv("DB_NAME", "ordersdb"),
+	)
+	db, err = sql.Open("mysql", dsn)
+	if err != nil {
+		log.Fatalf("Failed to open DB: %v", err)
+	}
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(10)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	if err = db.PingContext(context.Background()); err != nil {
+		log.Printf("WARNING: DB not reachable at startup: %v", err)
+	} else {
+		log.Println("✓ Connected to MySQL")
+	}
 
 	if snsTopicARN == "" {
 		log.Fatal("SNS_TOPIC_ARN environment variable is required")
@@ -308,6 +519,9 @@ func main() {
 	r.HandleFunc("/products/search", handleSearch).Methods("GET")
 	r.HandleFunc("/orders/sync", handleOrdersSync).Methods("POST")
 	r.HandleFunc("/orders/async", handleOrdersAsync).Methods("POST")
+	r.HandleFunc("/shopping-carts", handleCreateCart).Methods("POST")
+	r.HandleFunc("/shopping-carts/{id}", handleGetCart).Methods("GET")
+	r.HandleFunc("/shopping-carts/{id}/items", handleAddItem).Methods("POST")
 
 	port := getEnv("PORT", "8080")
 	log.Printf("Server starting on port %s", port)
