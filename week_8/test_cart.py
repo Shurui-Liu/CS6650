@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_URL = "http://product-api-service-alb-2056062177.us-west-2.elb.amazonaws.com"   # replace with ALB DNS after terraform apply
 CUSTOMER_ID = 1                      # must exist in customers table (see seed.sql)
-RESULTS_FILE = "mysql_test_results.json"
+RESULTS_FILE = "dynamodb_test_results.json"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -44,7 +44,7 @@ def phase_create(n=50):
     results  = []
     cart_ids = []
     for i in range(n):
-        resp, ms = timed_post(f"{BASE_URL}/shopping-carts", {"customer_id": CUSTOMER_ID})
+        resp, ms = timed_post(f"{BASE_URL}/dynamo/shopping-carts", {"customer_id": CUSTOMER_ID})
         results.append(record("create_cart", resp, ms))
         if resp.status_code == 201:
             cart_ids.append(resp.json()["cart_id"])
@@ -65,7 +65,7 @@ def phase_add_items(cart_ids):
             "quantity":   (i % 5) + 1,
             "unit_price": round(9.99 + i * 0.50, 2),
         }
-        resp, ms = timed_post(f"{BASE_URL}/shopping-carts/{cart_id}/items", body)
+        resp, ms = timed_post(f"{BASE_URL}/dynamo/shopping-carts/{cart_id}/items", body)
         results.append(record("add_items", resp, ms))
         if resp.status_code not in (200, 201):
             print(f"  [!] add_items cart {cart_id} failed {resp.status_code}: {resp.text[:80]}")
@@ -79,7 +79,7 @@ def phase_get(cart_ids):
     print(f"Phase 3: retrieving {n} carts...")
     results = []
     for cart_id in cart_ids:
-        resp, ms = timed_get(f"{BASE_URL}/shopping-carts/{cart_id}")
+        resp, ms = timed_get(f"{BASE_URL}/dynamo/shopping-carts/{cart_id}")
         results.append(record("get_cart", resp, ms))
         if resp.status_code != 200:
             print(f"  [!] get cart {cart_id} failed {resp.status_code}: {resp.text[:80]}")
