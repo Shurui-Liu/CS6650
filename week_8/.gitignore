@@ -1,0 +1,8 @@
+**.tfvars
+**.tfstate
+**.tfstate.*
+**/.terraform/
+
+# Go build artifacts
+*.exe
+/main
