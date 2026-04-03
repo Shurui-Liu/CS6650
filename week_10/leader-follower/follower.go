@@ -15,7 +15,8 @@ func NewFollower(store *KVStore) *Follower {
 	return &Follower{store: store}
 }
 
-// PUT /internal/kv/{key} — replication from leader; sleep 100ms before responding.
+// HandleInternalSet handles PUT /internal/kv/{key} — replication from the leader.
+// Sleeps 100ms to simulate storage write latency before responding.
 func (f *Follower) HandleInternalSet(w http.ResponseWriter, r *http.Request) {
 	key := strings.TrimPrefix(r.URL.Path, "/internal/kv/")
 	if key == "" {
@@ -23,18 +24,19 @@ func (f *Follower) HandleInternalSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var payload valuePayload
+	var payload replicationPayload
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
 		return
 	}
 
 	time.Sleep(100 * time.Millisecond) // simulate storage write delay
-	f.store.Set(key, payload.Value)
+	f.store.SetFollower(key, payload.Value, payload.Version)
 	w.WriteHeader(http.StatusCreated)
 }
 
-// GET /internal/kv/{key} — read request from leader; sleep 50ms before responding.
+// HandleInternalGet handles GET /internal/kv/{key} — read request from the leader.
+// Sleeps 50ms to simulate read latency, then returns the value with its version.
 func (f *Follower) HandleInternalGet(w http.ResponseWriter, r *http.Request) {
 	key := strings.TrimPrefix(r.URL.Path, "/internal/kv/")
 	if key == "" {
@@ -43,17 +45,18 @@ func (f *Follower) HandleInternalGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	time.Sleep(50 * time.Millisecond) // simulate read delay
-	val, ok := f.store.Get(key)
+	entry, ok := f.store.Get(key)
 	if !ok {
 		http.Error(w, "key not found", http.StatusNotFound)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(valuePayload{Value: val})
+	json.NewEncoder(w).Encode(replicationPayload{Value: entry.Value, Version: entry.Version})
 }
 
-// GET /kv/{key} — direct client read; serves local (possibly stale) data.
+// HandleGet handles GET /kv/{key} — direct client read from this follower.
+// Returns the local (possibly stale) value with no added delay.
 func (f *Follower) HandleGet(w http.ResponseWriter, r *http.Request) {
 	key := strings.TrimPrefix(r.URL.Path, "/kv/")
 	if key == "" {
@@ -61,12 +64,12 @@ func (f *Follower) HandleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	val, ok := f.store.Get(key)
+	entry, ok := f.store.Get(key)
 	if !ok {
 		http.Error(w, "key not found", http.StatusNotFound)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(valuePayload{Value: val})
+	json.NewEncoder(w).Encode(valuePayload{Value: entry.Value})
 }

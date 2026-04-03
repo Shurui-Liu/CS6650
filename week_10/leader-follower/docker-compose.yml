@@ -15,14 +15,34 @@ services:
     ports:
       - "8082:8080"
 
+  follower3:
+    build: .
+    environment:
+      ROLE: follower
+      PORT: "8080"
+    ports:
+      - "8083:8080"
+
+  follower4:
+    build: .
+    environment:
+      ROLE: follower
+      PORT: "8080"
+    ports:
+      - "8084:8080"
+
   leader:
     build: .
     environment:
       ROLE: leader
       PORT: "8080"
-      FOLLOWERS: "http://follower1:8080,http://follower2:8080"
+      FOLLOWERS: "http://follower1:8080,http://follower2:8080,http://follower3:8080,http://follower4:8080"
+      W: "5"   # change to 1 or 3 to switch strategy
+      R: "1"   # change to 5 or 3 to switch strategy
     ports:
       - "8080:8080"
     depends_on:
       - follower1
       - follower2
+      - follower3
+      - follower4
