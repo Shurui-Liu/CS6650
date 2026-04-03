@@ -1,0 +1,28 @@
+services:
+  follower1:
+    build: .
+    environment:
+      ROLE: follower
+      PORT: "8080"
+    ports:
+      - "8081:8080"
+
+  follower2:
+    build: .
+    environment:
+      ROLE: follower
+      PORT: "8080"
+    ports:
+      - "8082:8080"
+
+  leader:
+    build: .
+    environment:
+      ROLE: leader
+      PORT: "8080"
+      FOLLOWERS: "http://follower1:8080,http://follower2:8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      - follower1
+      - follower2
