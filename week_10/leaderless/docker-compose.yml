@@ -1,0 +1,40 @@
+services:
+  node1:
+    build: .
+    environment:
+      PORT: "8080"
+      PEERS: "http://node2:8080,http://node3:8080,http://node4:8080,http://node5:8080"
+    ports:
+      - "8081:8080"
+
+  node2:
+    build: .
+    environment:
+      PORT: "8080"
+      PEERS: "http://node1:8080,http://node3:8080,http://node4:8080,http://node5:8080"
+    ports:
+      - "8082:8080"
+
+  node3:
+    build: .
+    environment:
+      PORT: "8080"
+      PEERS: "http://node1:8080,http://node2:8080,http://node4:8080,http://node5:8080"
+    ports:
+      - "8083:8080"
+
+  node4:
+    build: .
+    environment:
+      PORT: "8080"
+      PEERS: "http://node1:8080,http://node2:8080,http://node3:8080,http://node5:8080"
+    ports:
+      - "8084:8080"
+
+  node5:
+    build: .
+    environment:
+      PORT: "8080"
+      PEERS: "http://node1:8080,http://node2:8080,http://node3:8080,http://node4:8080"
+    ports:
+      - "8085:8080"
