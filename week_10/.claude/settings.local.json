@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//e/000 Northeastern/CS6650/week_10/CS6650/**)",
+      "Read(//e/000 Northeastern/CS6650/week_10/**)",
+      "Bash(go mod:*)",
+      "Bash(go build:*)",
+      "Bash(./kv-service.exe)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8080/kv/foo)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" -X PUT -H \"Content-Type: application/json\" -d '{\"value\":\"bar\"}' http://localhost:8080/kv/foo)",
+      "Bash(curl -s -w \"\\\\n%{http_code}\" http://localhost:8080/kv/foo)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" -X PUT -H \"Content-Type: application/json\" -d '{\"value\":\"\"}' http://localhost:8080/kv/emptyval)"
+    ]
+  }
+}
