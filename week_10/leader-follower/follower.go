@@ -55,6 +55,24 @@ func (f *Follower) HandleInternalGet(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(replicationPayload{Value: entry.Value, Version: entry.Version})
 }
 
+// HandleLocalRead handles GET /local_read/{key}.
+// Testing-only endpoint: returns this follower's raw local value with no delays.
+// During an in-flight write the value may be stale — that is the point.
+func (f *Follower) HandleLocalRead(w http.ResponseWriter, r *http.Request) {
+	key := strings.TrimPrefix(r.URL.Path, "/local_read/")
+	if key == "" {
+		http.Error(w, "key cannot be empty", http.StatusBadRequest)
+		return
+	}
+	entry, ok := f.store.Get(key)
+	if !ok {
+		http.Error(w, "key not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(valuePayload{Value: entry.Value})
+}
+
 // HandleGet handles GET /kv/{key} — direct client read from this follower.
 // Returns the local (possibly stale) value with no added delay.
 func (f *Follower) HandleGet(w http.ResponseWriter, r *http.Request) {

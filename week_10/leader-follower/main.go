@@ -57,6 +57,13 @@ func main() {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			}
 		})
+		mux.HandleFunc("/local_read/", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				l.HandleLocalRead(w, r)
+			} else {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			}
+		})
 
 	case "follower":
 		log.Printf("starting as FOLLOWER on :%s", port)
@@ -78,6 +85,14 @@ func main() {
 			case http.MethodGet:
 				f.HandleInternalGet(w, r)
 			default:
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			}
+		})
+		// Testing-only endpoint: raw local read, no delays or quorum.
+		mux.HandleFunc("/local_read/", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				f.HandleLocalRead(w, r)
+			} else {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			}
 		})

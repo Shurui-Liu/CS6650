@@ -150,6 +150,25 @@ func (l *Leader) HandleGet(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(valuePayload{Value: best.Value})
 }
 
+// HandleLocalRead handles GET /local_read/{key}.
+// Testing-only endpoint: bypasses all quorum/replication logic and returns
+// whatever value this node currently holds in its local store.
+// Useful for observing in-flight inconsistency during a write operation.
+func (l *Leader) HandleLocalRead(w http.ResponseWriter, r *http.Request) {
+	key := strings.TrimPrefix(r.URL.Path, "/local_read/")
+	if key == "" {
+		http.Error(w, "key cannot be empty", http.StatusBadRequest)
+		return
+	}
+	entry, ok := l.store.Get(key)
+	if !ok {
+		http.Error(w, "key not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(valuePayload{Value: entry.Value})
+}
+
 // replicateOne sends a single replication PUT to one follower.
 func (l *Leader) replicateOne(follower, key string, body []byte) error {
 	url := fmt.Sprintf("%s/internal/kv/%s", follower, key)
