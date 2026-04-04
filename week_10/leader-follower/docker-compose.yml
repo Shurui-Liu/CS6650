@@ -37,8 +37,8 @@ services:
       ROLE: leader
       PORT: "8080"
       FOLLOWERS: "http://follower1:8080,http://follower2:8080,http://follower3:8080,http://follower4:8080"
-      W: "5"   # change to 1 or 3 to switch strategy
-      R: "1"   # change to 5 or 3 to switch strategy
+      W: "${W:-5}"   # override with: W=1 docker compose up -d
+      R: "${R:-1}"   # override with: R=5 docker compose up -d
     ports:
       - "8080:8080"
     depends_on:
