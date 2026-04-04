@@ -208,22 +208,27 @@ func doWrite(client *http.Client, urls []string, rng *rand.Rand,
 
 	url := fmt.Sprintf("%s/kv/%s", urls[rng.Intn(len(urls))], key)
 	body, _ := json.Marshal(map[string]string{"value": value})
-	req, _ := http.NewRequest(http.MethodPut, url, bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
 
 	start := time.Now()
-	resp, err := client.Do(req)
-	latency := time.Since(start)
-
 	rec := Record{
 		TimestampMs: float64(start.UnixNano()) / 1e6,
 		Type:        "write",
 		Key:         key,
-		LatencyMs:   float64(latency.Microseconds()) / 1000.0,
 		RWGapMs:     -1,
 		Label:       label,
 		WriteRatio:  writeRatio,
 	}
+
+	req, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(body))
+	if err != nil {
+		log.Printf("build request: %v", err)
+		return rec
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	latency := time.Since(start)
+	rec.LatencyMs = float64(latency.Microseconds()) / 1000.0
 	if err != nil {
 		return rec
 	}
