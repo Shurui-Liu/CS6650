@@ -3,17 +3,24 @@
 graph.py  —  Generate latency and read-write gap graphs from load test results.
 
 Reads one or more newline-delimited JSON files produced by the Go load-test
-client and generates three sets of PNG graphs:
+client and generates the following PNG graphs:
 
-  1. latency_<label>.png
+  1. latency_cdf_<label>.png
         For each database configuration, CDF of read latency and write latency,
         with one curve per write-ratio.  X-axis is log-scaled to expose the
-        long tail.  Dashed vertical lines mark the p99 for each curve.
+        long tail.  Dashed vertical lines mark p50/p95/p99.
 
-  2. stale_reads.png
+  2. latency_hist_<label>.png
+        For each configuration, a log-log histogram of latency for reads and
+        writes separately.  The log-log scale makes heavy tails visually clear.
+
+  3. latency_tail_<label>.png
+        Tail zoom: CDF cropped to the p90–p100 region so outliers stand out.
+
+  4. stale_reads.png
         Bar chart showing stale-read percentage per (config, write-ratio).
 
-  3. rw_gap_distribution.png
+  5. rw_gap_distribution.png
         Histogram of the time gap between the last write to a key and a
         subsequent read of that same key.  Demonstrates the "local-in-time"
         property of the load generator.
@@ -87,10 +94,8 @@ def cdf(data):
 
 # ── Graph 1: latency CDFs ─────────────────────────────────────────────────────
 
-def plot_latency_cdfs(records, outdir):
-    """One PNG per label: read CDF (left) and write CDF (right)."""
-
-    # grouped[label][ratio][type] = [latency_ms, ...]
+def _collect_latency(records):
+    """Return grouped[label][ratio][type] = [latency_ms, ...] for successful ops."""
     grouped = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     for r in records:
         sc = r.get("status_code", 0)
@@ -98,10 +103,17 @@ def plot_latency_cdfs(records, outdir):
             grouped[r["label"]][round(r["write_ratio"], 2)][r["type"]].append(
                 r["latency_ms"]
             )
+    return grouped
+
+
+def plot_latency_cdfs(records, outdir):
+    """One PNG per label: read CDF (left) and write CDF (right), log x-scale."""
+
+    grouped = _collect_latency(records)
 
     for label, ratio_data in sorted(grouped.items()):
         fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-        fig.suptitle(f"Latency Distribution — {label}", fontsize=14, fontweight="bold")
+        fig.suptitle(f"Latency CDF — {label}", fontsize=14, fontweight="bold")
 
         panels = [
             (axes[0], "read",  "Read Latency CDF"),
@@ -132,14 +144,138 @@ def plot_latency_cdfs(records, outdir):
             ax.grid(True, which="both", alpha=0.25)
             ax.set_yticks(range(0, 101, 10))
 
-        # Add a note explaining the dashed lines.
         fig.text(
             0.5, 0.01,
             "Dashed verticals: dotted=p50, dashed=p95, dash-dot=p99",
             ha="center", fontsize=8, color="gray",
         )
 
-        path = os.path.join(outdir, f"latency_{label}.png")
+        path = os.path.join(outdir, f"latency_cdf_{label}.png")
+        plt.tight_layout(rect=[0, 0.03, 1, 1])
+        plt.savefig(path, dpi=150)
+        plt.close()
+        print(f"saved {path}")
+
+
+def plot_latency_histograms(records, outdir):
+    """
+    Log-log histogram of latency per label.  Log x-axis = natural for latency;
+    log y-axis makes the heavy tail visible even when the body dwarfs the tail.
+    One PNG per label, read (left) and write (right).
+    """
+    grouped = _collect_latency(records)
+
+    for label, ratio_data in sorted(grouped.items()):
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        fig.suptitle(f"Latency Distribution (Histogram) — {label}",
+                     fontsize=14, fontweight="bold")
+
+        panels = [
+            (axes[0], "read",  "Read Latency Distribution"),
+            (axes[1], "write", "Write Latency Distribution"),
+        ]
+
+        for ax, rtype, title in panels:
+            all_lats = [l for ratio in ratio_data.values()
+                        for l in ratio.get(rtype, [])]
+            if not all_lats:
+                ax.set_title(title)
+                continue
+
+            # Common log-spaced bins across all ratios for comparability.
+            lo = max(0.01, min(all_lats))
+            hi = max(all_lats)
+            bins = np.logspace(np.log10(lo), np.log10(hi + 1), 60)
+
+            for ratio in sorted(ratio_data.keys()):
+                lats = ratio_data[ratio].get(rtype, [])
+                if not lats:
+                    continue
+                meta = ratio_meta(ratio)
+                ax.hist(lats, bins=bins, alpha=0.55, color=meta["color"],
+                        label=meta["label"], density=True)
+
+                # Overlay p50 and p99 tick marks on x-axis.
+                for pct, ls in [(50, "--"), (99, "-.")]:
+                    v = np.percentile(lats, pct)
+                    ax.axvline(v, color=meta["color"], linestyle=ls,
+                               alpha=0.6, linewidth=1.0,
+                               label=f"p{pct} ({meta['label'].split()[0]})" if ratio == sorted(ratio_data.keys())[0] else "")
+
+            ax.set_xscale("log")
+            ax.set_yscale("log")          # log y makes the tail visible
+            ax.xaxis.set_major_formatter(ticker.ScalarFormatter())
+            ax.set_xlabel("Latency (ms)", fontsize=11)
+            ax.set_ylabel("Density (log scale)", fontsize=11)
+            ax.set_title(title, fontsize=12)
+            ax.legend(fontsize=8, loc="upper right")
+            ax.grid(True, which="both", alpha=0.25)
+
+        fig.text(
+            0.5, 0.01,
+            "Log-log scale: body of distribution on left, long tail visible on right",
+            ha="center", fontsize=8, color="gray",
+        )
+
+        path = os.path.join(outdir, f"latency_hist_{label}.png")
+        plt.tight_layout(rect=[0, 0.03, 1, 1])
+        plt.savefig(path, dpi=150)
+        plt.close()
+        print(f"saved {path}")
+
+
+def plot_latency_tail(records, outdir):
+    """
+    Tail zoom: CDF restricted to the p90–p100 region.
+    Makes outlier structure in the far tail visually clear.
+    One PNG per label.
+    """
+    grouped = _collect_latency(records)
+
+    for label, ratio_data in sorted(grouped.items()):
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        fig.suptitle(f"Tail Latency Zoom (p90–p100) — {label}",
+                     fontsize=14, fontweight="bold")
+
+        panels = [
+            (axes[0], "read",  "Read Latency Tail"),
+            (axes[1], "write", "Write Latency Tail"),
+        ]
+
+        for ax, rtype, title in panels:
+            for ratio in sorted(ratio_data.keys()):
+                lats = ratio_data[ratio].get(rtype, [])
+                if len(lats) < 10:
+                    continue
+                meta = ratio_meta(ratio)
+                x, y = cdf(lats)
+                # Keep only the top 10 % of the CDF.
+                cutoff = np.percentile(lats, 90)
+                mask = [xi >= cutoff for xi in x]
+                xs = [xi for xi, m in zip(x, mask) if m]
+                ys = [yi for yi, m in zip(y, mask) if m]
+                if xs:
+                    ax.plot(xs, ys, color=meta["color"], label=meta["label"],
+                            linewidth=1.8)
+                    ax.axvline(np.percentile(lats, 99), color=meta["color"],
+                               linestyle="-.", alpha=0.5, linewidth=1.0)
+
+            ax.set_xlabel("Latency (ms)", fontsize=11)
+            ax.set_ylabel("Percentile (%)", fontsize=11)
+            ax.set_title(title, fontsize=12)
+            ax.set_ylim(90, 100)
+            ax.set_xscale("log")
+            ax.xaxis.set_major_formatter(ticker.ScalarFormatter())
+            ax.legend(fontsize=9, loc="upper left")
+            ax.grid(True, which="both", alpha=0.25)
+
+        fig.text(
+            0.5, 0.01,
+            "Dash-dot verticals mark p99 per curve",
+            ha="center", fontsize=8, color="gray",
+        )
+
+        path = os.path.join(outdir, f"latency_tail_{label}.png")
         plt.tight_layout(rect=[0, 0.03, 1, 1])
         plt.savefig(path, dpi=150)
         plt.close()
@@ -337,6 +473,8 @@ def main():
     os.makedirs(args.outdir, exist_ok=True)
     print_summary(records)
     plot_latency_cdfs(records, args.outdir)
+    plot_latency_histograms(records, args.outdir)
+    plot_latency_tail(records, args.outdir)
     plot_stale_reads(records, args.outdir)
     plot_rw_gap(records, args.outdir)
     print("Done.")

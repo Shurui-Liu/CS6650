@@ -11,7 +11,9 @@
       "Bash(curl -s -w \"\\\\n%{http_code}\" http://localhost:8080/kv/foo)",
       "Bash(curl -s -o /dev/null -w \"%{http_code}\" -X PUT -H \"Content-Type: application/json\" -d '{\"value\":\"\"}' http://localhost:8080/kv/emptyval)",
       "Bash(docker build:*)",
-      "Bash(go test:*)"
+      "Bash(go test:*)",
+      "Bash(wc:*)",
+      "Bash(python graph.py --outdir graphs/)"
     ]
   }
 }
