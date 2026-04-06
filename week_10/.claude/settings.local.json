@@ -13,7 +13,19 @@
       "Bash(docker build:*)",
       "Bash(go test:*)",
       "Bash(wc:*)",
-      "Bash(python graph.py --outdir graphs/)"
+      "Bash(python graph.py --outdir graphs/)",
+      "Bash(ls:*)",
+      "Bash(python3 -c \"import json,sys; d=json.loads\\(sys.stdin.read\\(\\)\\); print\\(d.get\\('label'\\)\\)\")",
+      "Bash(python3 graph.py --dir . --outdir graphs/)",
+      "Bash(python3 -c \"import json,sys; [print\\(json.dumps\\(json.loads\\(l\\), indent=2\\)\\) for l in sys.stdin]\")",
+      "Bash(python3:*)",
+      "Bash(docker compose:*)",
+      "Bash(curl -s http://localhost:8080/kv/test)",
+      "Bash(curl -s http://localhost:8081/kv/test)",
+      "Bash(./loadtest.exe -label W5R1 -write-urls http://localhost:8080 -read-urls http://localhost:8081,http://localhost:8082,http://localhost:8083,http://localhost:8084 -write-ratio 0.01 -duration 30s -output W5R1_01pct.jsonl)",
+      "Bash(./loadtest.exe -label W5R1 -write-urls http://localhost:8080 -read-urls http://localhost:8081,http://localhost:8082,http://localhost:8083,http://localhost:8084 -write-ratio 0.10 -duration 30s -output W5R1_10pct.jsonl)",
+      "Bash(./loadtest.exe -label W5R1 -write-urls http://localhost:8080 -read-urls http://localhost:8081,http://localhost:8082,http://localhost:8083,http://localhost:8084 -write-ratio 0.50 -duration 30s -output W5R1_50pct.jsonl)",
+      "Bash(./loadtest.exe -label W5R1 -write-urls http://localhost:8080 -read-urls http://localhost:8081,http://localhost:8082,http://localhost:8083,http://localhost:8084 -write-ratio 0.90 -duration 30s -output W5R1_90pct.jsonl)"
     ]
   }
 }
