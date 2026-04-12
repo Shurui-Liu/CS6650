@@ -26,9 +26,14 @@ type CreateAlbumRequest struct {
 	Owner       string `json:"owner"`
 }
 
+// PhotoMessage is sent to SQS after a photo upload.
+// CurrentKey is where the file lives now (may be a tmp/ path for large files).
+// FinalKey is the canonical albums/ path the worker should move it to.
+// When CurrentKey == FinalKey the file is already in its final location.
 type PhotoMessage struct {
-	PhotoID string `json:"photo_id"`
-	AlbumID string `json:"album_id"`
-	Seq     int    `json:"seq"`
-	S3Key   string `json:"s3_key"`
+	PhotoID    string `json:"photo_id"`
+	AlbumID    string `json:"album_id"`
+	Seq        int    `json:"seq"`
+	CurrentKey string `json:"current_key"`
+	FinalKey   string `json:"final_key"`
 }

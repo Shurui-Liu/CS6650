@@ -7,12 +7,13 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 type Client struct {
-	svc        *s3.Client
-	bucket     string
-	baseURL    string
+	svc     *s3.Client
+	bucket  string
+	baseURL string
 }
 
 func New(cfg aws.Config, bucket, baseURL string) *Client {
@@ -37,10 +38,42 @@ func (c *Client) Upload(ctx context.Context, key, contentType string, r io.Reade
 	return fmt.Sprintf("%s/%s", c.baseURL, key), nil
 }
 
+// Copy copies an object within the same bucket (used to move tmp/ → albums/).
+func (c *Client) Copy(ctx context.Context, srcKey, dstKey string) error {
+	copySource := fmt.Sprintf("%s/%s", c.bucket, srcKey)
+	_, err := c.svc.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket:     &c.bucket,
+		CopySource: aws.String(copySource),
+		Key:        aws.String(dstKey),
+	})
+	if err != nil {
+		return fmt.Errorf("s3 copy %s → %s: %w", srcKey, dstKey, err)
+	}
+	return nil
+}
+
+// Delete removes a single object.
 func (c *Client) Delete(ctx context.Context, key string) error {
 	_, err := c.svc.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: &c.bucket,
 		Key:    &key,
+	})
+	return err
+}
+
+// DeleteObjects removes up to 1000 objects in a single API call.
+// Silently succeeds if keys is empty.
+func (c *Client) DeleteObjects(ctx context.Context, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	objs := make([]types.ObjectIdentifier, len(keys))
+	for i, k := range keys {
+		objs[i] = types.ObjectIdentifier{Key: aws.String(k)}
+	}
+	_, err := c.svc.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		Bucket: &c.bucket,
+		Delete: &types.Delete{Objects: objs, Quiet: aws.Bool(true)},
 	})
 	return err
 }

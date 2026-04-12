@@ -24,15 +24,14 @@ import (
 )
 
 func main() {
-	// Load .env if present (ignored in production where env vars are set directly).
+	// Load .env if present (ignored in production where env vars come from the env file).
 	_ = godotenv.Load()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	// ── Database ──────────────────────────────────────────────────────────────
-	databaseURL := mustEnv("DATABASE_URL")
-	pool, err := db.New(ctx, databaseURL)
+	pool, err := db.New(ctx, mustEnv("DATABASE_URL"))
 	if err != nil {
 		log.Fatalf("db.New: %v", err)
 	}
@@ -45,6 +44,8 @@ func main() {
 	queries := db.NewQueries(pool)
 
 	// ── AWS ───────────────────────────────────────────────────────────────────
+	// On EC2, config.LoadDefaultConfig picks up credentials from the instance
+	// metadata service automatically — no static keys needed.
 	awsCfg, err := config.LoadDefaultConfig(ctx,
 		config.WithRegion(mustEnv("AWS_REGION")),
 	)
@@ -58,7 +59,7 @@ func main() {
 
 	// ── Worker ────────────────────────────────────────────────────────────────
 	concurrency := envInt("WORKER_CONCURRENCY", 20)
-	w := worker.New(queries, sqsClient, s3Base, concurrency)
+	w := worker.New(queries, sqsClient, s3Client, s3Base, concurrency)
 	go w.Run(ctx)
 
 	// ── Router ────────────────────────────────────────────────────────────────
@@ -67,14 +68,18 @@ func main() {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RequestID)
 
+	// Health never touches the DB.
 	r.Get("/health", handler.Health)
 
-	albumH := handler.NewAlbumHandler(queries)
+	albumH := handler.NewAlbumHandler(queries, s3Client)
 	photoH := handler.NewPhotoHandler(queries, s3Client, sqsClient, s3Base)
 
 	r.Route("/albums", func(r chi.Router) {
+		r.Get("/", albumH.List)
 		r.Post("/", albumH.Create)
 		r.Get("/{albumId}", albumH.Get)
+		r.Put("/{albumId}", albumH.Upsert)
+		r.Delete("/{albumId}", albumH.Delete)
 		r.Post("/{albumId}/photos", photoH.Upload)
 		r.Get("/{albumId}/photos", photoH.List)
 	})

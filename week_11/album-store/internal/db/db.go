@@ -34,11 +34,19 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 			album_id    TEXT        NOT NULL REFERENCES albums(album_id),
 			seq         INTEGER     NOT NULL,
 			status      TEXT        NOT NULL DEFAULT 'processing',
+			s3_key      TEXT        NOT NULL DEFAULT '',
 			url         TEXT,
 			created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 		);
 
 		CREATE INDEX IF NOT EXISTS photos_album_idx ON photos(album_id);
+
+		-- Idempotent column addition for existing deployments that lack s3_key.
+		DO $$
+		BEGIN
+			ALTER TABLE photos ADD COLUMN IF NOT EXISTS s3_key TEXT NOT NULL DEFAULT '';
+		EXCEPTION WHEN duplicate_column THEN NULL;
+		END $$;
 	`)
 	return err
 }

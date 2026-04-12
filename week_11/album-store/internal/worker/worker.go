@@ -10,17 +10,19 @@ import (
 	"album-store/internal/db"
 	"album-store/internal/model"
 	"album-store/internal/queue"
+	"album-store/internal/storage"
 )
 
 type Worker struct {
 	q           *db.Queries
 	sqs         *queue.Client
+	s3          *storage.Client
 	s3Base      string
 	concurrency int
 }
 
-func New(q *db.Queries, sqs *queue.Client, s3Base string, concurrency int) *Worker {
-	return &Worker{q: q, sqs: sqs, s3Base: s3Base, concurrency: concurrency}
+func New(q *db.Queries, sqs *queue.Client, s3 *storage.Client, s3Base string, concurrency int) *Worker {
+	return &Worker{q: q, sqs: sqs, s3: s3, s3Base: s3Base, concurrency: concurrency}
 }
 
 // Run polls SQS and processes messages until ctx is cancelled.
@@ -54,7 +56,7 @@ func (w *Worker) Run(ctx context.Context) {
 					return
 				}
 				if err := w.sqs.DeleteMessage(ctx, m.ReceiptHandle); err != nil {
-					log.Printf("worker: delete %s: %v", m.ID, err)
+					log.Printf("worker: delete msg %s: %v", m.ID, err)
 				}
 			}(msg)
 		}
@@ -68,7 +70,18 @@ func (w *Worker) process(ctx context.Context, m queue.Message) error {
 		return fmt.Errorf("unmarshal: %w", err)
 	}
 
-	publicURL := fmt.Sprintf("%s/%s", w.s3Base, msg.S3Key)
+	// Large files land in tmp/ first; move them to the canonical albums/ path.
+	if msg.CurrentKey != msg.FinalKey {
+		if err := w.s3.Copy(ctx, msg.CurrentKey, msg.FinalKey); err != nil {
+			return fmt.Errorf("s3 copy: %w", err)
+		}
+		if err := w.s3.Delete(ctx, msg.CurrentKey); err != nil {
+			// Non-fatal: object is already in the right place.
+			log.Printf("worker: delete tmp %s: %v", msg.CurrentKey, err)
+		}
+	}
+
+	publicURL := fmt.Sprintf("%s/%s", w.s3Base, msg.FinalKey)
 	if err := w.q.MarkPhotoProcessed(ctx, msg.PhotoID, publicURL); err != nil {
 		return fmt.Errorf("mark processed: %w", err)
 	}
