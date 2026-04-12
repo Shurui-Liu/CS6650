@@ -3,19 +3,69 @@ package db
 import (
 	"context"
 	"fmt"
+	"os"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func New(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
-	pool, err := pgxpool.New(ctx, databaseURL)
+// Pools holds separate connection pools for the primary (writer) and
+// read replica (reader). If DATABASE_READER_URL is unset, reader falls
+// back to the primary so the app works without a replica.
+type Pools struct {
+	Writer *pgxpool.Pool
+	Reader *pgxpool.Pool
+}
+
+func (p *Pools) Close() {
+	p.Writer.Close()
+	if p.Reader != p.Writer {
+		p.Reader.Close()
+	}
+}
+
+// Connect creates both pools from environment variables.
+// MaxConns is kept at 10 per pool per instance because PgBouncer
+// (Change 5) multiplexes many app connections through a smaller RDS pool.
+// SimpleProtocol is mandatory: PgBouncer in transaction mode does not
+// support the extended query protocol used by pgx for prepared statements.
+func Connect(ctx context.Context) (*Pools, error) {
+	writerCfg, err := pgxpool.ParseConfig(os.Getenv("DATABASE_URL"))
 	if err != nil {
-		return nil, fmt.Errorf("pgxpool.New: %w", err)
+		return nil, fmt.Errorf("parse writer url: %w", err)
 	}
-	if err := pool.Ping(ctx); err != nil {
-		return nil, fmt.Errorf("db ping: %w", err)
+	writerCfg.MaxConns = 10
+	writerCfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+
+	writer, err := pgxpool.NewWithConfig(ctx, writerCfg)
+	if err != nil {
+		return nil, fmt.Errorf("writer pool: %w", err)
 	}
-	return pool, nil
+	if err := writer.Ping(ctx); err != nil {
+		return nil, fmt.Errorf("writer ping: %w", err)
+	}
+
+	readerURL := os.Getenv("DATABASE_READER_URL")
+	if readerURL == "" {
+		readerURL = os.Getenv("DATABASE_URL")
+	}
+
+	readerCfg, err := pgxpool.ParseConfig(readerURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse reader url: %w", err)
+	}
+	readerCfg.MaxConns = 10
+	readerCfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+
+	reader, err := pgxpool.NewWithConfig(ctx, readerCfg)
+	if err != nil {
+		return nil, fmt.Errorf("reader pool: %w", err)
+	}
+	if err := reader.Ping(ctx); err != nil {
+		return nil, fmt.Errorf("reader ping: %w", err)
+	}
+
+	return &Pools{Writer: writer, Reader: reader}, nil
 }
 
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {

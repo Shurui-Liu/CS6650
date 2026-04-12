@@ -16,6 +16,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/joho/godotenv"
 
+	"album-store/internal/cache"
 	"album-store/internal/db"
 	"album-store/internal/handler"
 	"album-store/internal/queue"
@@ -31,17 +32,19 @@ func main() {
 	defer cancel()
 
 	// ── Database ──────────────────────────────────────────────────────────────
-	pool, err := db.New(ctx, mustEnv("DATABASE_URL"))
+	// Connect() uses DATABASE_URL (writer/primary) and DATABASE_READER_URL
+	// (replica). Falls back to primary if replica is not configured.
+	pools, err := db.Connect(ctx)
 	if err != nil {
-		log.Fatalf("db.New: %v", err)
+		log.Fatalf("db.Connect: %v", err)
 	}
-	defer pool.Close()
+	defer pools.Close()
 
-	if err := db.Migrate(ctx, pool); err != nil {
+	if err := db.Migrate(ctx, pools.Writer); err != nil {
 		log.Fatalf("db.Migrate: %v", err)
 	}
 
-	queries := db.NewQueries(pool)
+	queries := db.NewQueries(pools)
 
 	// ── AWS ───────────────────────────────────────────────────────────────────
 	// On EC2, config.LoadDefaultConfig picks up credentials from the instance
@@ -57,12 +60,30 @@ func main() {
 	s3Client := storage.New(awsCfg, mustEnv("S3_BUCKET"), s3Base)
 	sqsClient := queue.New(awsCfg, mustEnv("SQS_QUEUE_URL"))
 
+	// ── Redis ─────────────────────────────────────────────────────────────────
+	// nil if REDIS_ADDR is unset — cache package handles nil gracefully.
+	rdb := cache.New()
+
 	// ── Worker ────────────────────────────────────────────────────────────────
-	concurrency := envInt("WORKER_CONCURRENCY", 20)
-	w := worker.New(queries, sqsClient, s3Client, s3Base, concurrency)
-	go w.Run(ctx)
+	// API instances set WORKER_CONCURRENCY=0 to skip the worker loop entirely.
+	// Dedicated worker instances set it to a non-zero value (default 20).
+	concurrency := envInt("WORKER_CONCURRENCY", 0)
+	if concurrency > 0 {
+		w := worker.New(queries, sqsClient, s3Client, s3Base, concurrency)
+		go w.Run(ctx)
+	}
 
 	// ── Router ────────────────────────────────────────────────────────────────
+	// Worker instances may have PORT unset — skip HTTP listener in that case.
+	port := os.Getenv("PORT")
+	if port == "" {
+		// No HTTP server: run as a pure worker process.
+		log.Println("PORT not set — running as worker only")
+		<-ctx.Done()
+		log.Println("shutting down...")
+		return
+	}
+
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
@@ -71,7 +92,7 @@ func main() {
 	// Health never touches the DB.
 	r.Get("/health", handler.Health)
 
-	albumH := handler.NewAlbumHandler(queries, s3Client)
+	albumH := handler.NewAlbumHandler(queries, s3Client, rdb)
 	photoH := handler.NewPhotoHandler(queries, s3Client, sqsClient, s3Base)
 
 	r.Route("/albums", func(r chi.Router) {
@@ -84,8 +105,6 @@ func main() {
 		r.Get("/{albumId}/photos", photoH.List)
 	})
 
-	// ── HTTP server ───────────────────────────────────────────────────────────
-	port := envString("PORT", "8080")
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%s", port),
 		Handler:      r,
@@ -116,13 +135,6 @@ func mustEnv(key string) string {
 		log.Fatalf("required env var %s is not set", key)
 	}
 	return v
-}
-
-func envString(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
 }
 
 func envInt(key string, fallback int) int {

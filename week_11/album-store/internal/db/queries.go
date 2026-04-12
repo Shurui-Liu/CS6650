@@ -8,19 +8,23 @@ import (
 	"album-store/internal/model"
 )
 
+// Queries routes each operation to the correct pool:
+//   - writer (primary) for INSERT / UPDATE / DELETE
+//   - reader (replica) for SELECT-only operations
 type Queries struct {
-	pool *pgxpool.Pool
+	writer *pgxpool.Pool
+	reader *pgxpool.Pool
 }
 
-func NewQueries(pool *pgxpool.Pool) *Queries {
-	return &Queries{pool: pool}
+func NewQueries(pools *Pools) *Queries {
+	return &Queries{writer: pools.Writer, reader: pools.Reader}
 }
 
 // ── Albums ────────────────────────────────────────────────────────────────────
 
 func (q *Queries) CreateAlbum(ctx context.Context, albumID string, r model.CreateAlbumRequest) (model.Album, error) {
 	var a model.Album
-	err := q.pool.QueryRow(ctx,
+	err := q.writer.QueryRow(ctx,
 		`INSERT INTO albums (album_id, title, description, owner)
 		 VALUES ($1, $2, $3, $4)
 		 RETURNING album_id, title, description, owner, photo_seq, created_at`,
@@ -32,7 +36,7 @@ func (q *Queries) CreateAlbum(ctx context.Context, albumID string, r model.Creat
 // UpsertAlbum inserts or updates an album identified by albumID.
 func (q *Queries) UpsertAlbum(ctx context.Context, albumID string, r model.CreateAlbumRequest) (model.Album, error) {
 	var a model.Album
-	err := q.pool.QueryRow(ctx,
+	err := q.writer.QueryRow(ctx,
 		`INSERT INTO albums (album_id, title, description, owner)
 		 VALUES ($1, $2, $3, $4)
 		 ON CONFLICT (album_id) DO UPDATE
@@ -45,9 +49,10 @@ func (q *Queries) UpsertAlbum(ctx context.Context, albumID string, r model.Creat
 	return a, err
 }
 
+// GetAlbum reads from the replica — SELECT only.
 func (q *Queries) GetAlbum(ctx context.Context, albumID string) (model.Album, error) {
 	var a model.Album
-	err := q.pool.QueryRow(ctx,
+	err := q.reader.QueryRow(ctx,
 		`SELECT album_id, title, description, owner, photo_seq, created_at
 		 FROM albums WHERE album_id = $1`,
 		albumID,
@@ -55,9 +60,9 @@ func (q *Queries) GetAlbum(ctx context.Context, albumID string) (model.Album, er
 	return a, err
 }
 
-// ListAlbums returns every album, newest first. No pagination.
+// ListAlbums returns every album, newest first. No pagination. Reads from replica.
 func (q *Queries) ListAlbums(ctx context.Context) ([]model.Album, error) {
-	rows, err := q.pool.Query(ctx,
+	rows, err := q.reader.Query(ctx,
 		`SELECT album_id, title, description, owner, photo_seq, created_at
 		 FROM albums ORDER BY created_at DESC`,
 	)
@@ -79,7 +84,7 @@ func (q *Queries) ListAlbums(ctx context.Context) ([]model.Album, error) {
 
 // DeleteAlbum removes an album row. Call DeletePhotosForAlbum first.
 func (q *Queries) DeleteAlbum(ctx context.Context, albumID string) error {
-	_, err := q.pool.Exec(ctx, `DELETE FROM albums WHERE album_id = $1`, albumID)
+	_, err := q.writer.Exec(ctx, `DELETE FROM albums WHERE album_id = $1`, albumID)
 	return err
 }
 
@@ -88,7 +93,7 @@ func (q *Queries) DeleteAlbum(ctx context.Context, albumID string) error {
 // NextPhotoSeq atomically increments photo_seq and returns the new value.
 func (q *Queries) NextPhotoSeq(ctx context.Context, albumID string) (int, error) {
 	var seq int
-	err := q.pool.QueryRow(ctx,
+	err := q.writer.QueryRow(ctx,
 		`UPDATE albums SET photo_seq = photo_seq + 1
 		 WHERE album_id = $1
 		 RETURNING photo_seq`,
@@ -101,17 +106,18 @@ func (q *Queries) NextPhotoSeq(ctx context.Context, albumID string) (int, error)
 // s3Key is the FINAL canonical key (albums/…), stored for later S3 cleanup.
 func (q *Queries) CreatePhoto(ctx context.Context, photoID, albumID, s3Key string, seq int) (model.Photo, error) {
 	var p model.Photo
-	err := q.pool.QueryRow(ctx,
+	err := q.writer.QueryRow(ctx,
 		`INSERT INTO photos (photo_id, album_id, seq, s3_key, status)
 		 VALUES ($1, $2, $3, $4, 'processing')
 		 RETURNING photo_id, album_id, seq, status, url, created_at`,
-		photoID, albumID, s3Key, seq,
+		photoID, albumID, seq, s3Key,
 	).Scan(&p.PhotoID, &p.AlbumID, &p.Seq, &p.Status, &p.URL, &p.CreatedAt)
 	return p, err
 }
 
+// ListPhotos reads from the replica.
 func (q *Queries) ListPhotos(ctx context.Context, albumID string) ([]model.Photo, error) {
-	rows, err := q.pool.Query(ctx,
+	rows, err := q.reader.Query(ctx,
 		`SELECT photo_id, album_id, seq, status, url, created_at
 		 FROM photos WHERE album_id = $1 ORDER BY seq`,
 		albumID,
@@ -134,7 +140,7 @@ func (q *Queries) ListPhotos(ctx context.Context, albumID string) ([]model.Photo
 
 // MarkPhotoProcessed sets status='processed' and the public S3 URL.
 func (q *Queries) MarkPhotoProcessed(ctx context.Context, photoID, url string) error {
-	_, err := q.pool.Exec(ctx,
+	_, err := q.writer.Exec(ctx,
 		`UPDATE photos SET status = 'processed', url = $2 WHERE photo_id = $1`,
 		photoID, url,
 	)
@@ -142,9 +148,9 @@ func (q *Queries) MarkPhotoProcessed(ctx context.Context, photoID, url string) e
 }
 
 // ListPhotoS3Keys returns the s3_key for every photo in an album.
-// Used to clean up S3 before deleting an album.
+// Used to clean up S3 before deleting an album. Reads from replica.
 func (q *Queries) ListPhotoS3Keys(ctx context.Context, albumID string) ([]string, error) {
-	rows, err := q.pool.Query(ctx,
+	rows, err := q.reader.Query(ctx,
 		`SELECT s3_key FROM photos WHERE album_id = $1 AND s3_key != ''`,
 		albumID,
 	)
@@ -166,6 +172,6 @@ func (q *Queries) ListPhotoS3Keys(ctx context.Context, albumID string) ([]string
 
 // DeletePhotosForAlbum removes all photo rows for an album.
 func (q *Queries) DeletePhotosForAlbum(ctx context.Context, albumID string) error {
-	_, err := q.pool.Exec(ctx, `DELETE FROM photos WHERE album_id = $1`, albumID)
+	_, err := q.writer.Exec(ctx, `DELETE FROM photos WHERE album_id = $1`, albumID)
 	return err
 }

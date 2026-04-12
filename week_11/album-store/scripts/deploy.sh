@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Usage: ./scripts/deploy.sh <ec2-public-ip> <ecr-repo-url> [ssh-key-path]
-# Builds the Docker image, pushes to ECR, and restarts the container on EC2.
+# Usage: ./scripts/deploy.sh <ecr-repo-url> [ssh-key-path]
+# Builds the Docker image, pushes to ECR, then rolling-restarts the API ASG
+# by terminating instances one at a time (ASG replaces each automatically).
 set -euo pipefail
 
-EC2_IP="${1:?EC2 public IP required}"
-ECR_REPO="${2:?ECR repo URL required}"
-SSH_KEY="${3:-~/.ssh/id_rsa}"
+ECR_REPO="${1:?ECR repo URL required (terraform output ecr_repo_url)}"
+SSH_KEY="${2:-~/.ssh/id_rsa}"
 REGION="${AWS_REGION:-us-east-1}"
+API_ASG="album-store-api-asg"
 
 echo "==> Authenticating with ECR..."
 aws ecr get-login-password --region "$REGION" \
@@ -19,24 +20,29 @@ docker buildx build \
   --push \
   .
 
-echo "==> Deploying to EC2 ${EC2_IP}..."
-ssh -i "$SSH_KEY" \
-    -o StrictHostKeyChecking=no \
-    "ec2-user@${EC2_IP}" \
-    "bash -s" <<REMOTE
-set -e
-aws ecr get-login-password --region ${REGION} \
-  | docker login --username AWS --password-stdin ${ECR_REPO}
-docker pull ${ECR_REPO}:latest
-docker stop album-store 2>/dev/null || true
-docker rm   album-store 2>/dev/null || true
-docker run -d --name album-store \
-  --env-file /opt/album-store.env \
-  -p 8080:8080 \
-  --restart unless-stopped \
-  ${ECR_REPO}:latest
-echo "==> Container started"
-docker ps --filter name=album-store
-REMOTE
+echo "==> Rolling restart of ASG: ${API_ASG}..."
+INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-names "$API_ASG" \
+  --region "$REGION" \
+  --query "AutoScalingGroups[0].Instances[*].InstanceId" \
+  --output text)
 
-echo "==> Done. Service: http://${EC2_IP}:8080/health"
+for ID in $INSTANCE_IDS; do
+  echo "  Terminating ${ID} (ASG will launch replacement)..."
+  aws autoscaling terminate-instance-in-auto-scaling-group \
+    --instance-id "$ID" \
+    --no-should-decrement-desired-capacity \
+    --region "$REGION"
+  echo "  Waiting 90s for replacement to become healthy..."
+  sleep 90
+done
+
+ALB_DNS=$(aws elbv2 describe-load-balancers \
+  --names album-store-alb \
+  --region "$REGION" \
+  --query "LoadBalancers[0].DNSName" \
+  --output text 2>/dev/null || echo "unknown")
+
+echo "==> Deploy complete."
+echo "    Base URL: http://${ALB_DNS}"
+echo "    Health:   http://${ALB_DNS}/health"

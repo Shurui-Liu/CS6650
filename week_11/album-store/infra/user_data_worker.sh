@@ -32,18 +32,16 @@ log_connections    = 0
 log_disconnections = 0
 PEOF
 
-# Substitute Terraform variables into the pgbouncer.ini that used heredoc literals.
 sed -i "s|\${rds_host}|${rds_host}|g" /etc/pgbouncer/pgbouncer.ini
 
-# PgBouncer userlist: "user" "password" format (md5 auth).
 echo '"albumuser" "${db_password}"' > /etc/pgbouncer/userlist.txt
 
 systemctl enable pgbouncer
 systemctl start pgbouncer
 
 # ── Environment file ──────────────────────────────────────────────────────────
-# WORKER_CONCURRENCY=0 disables the worker loop on API instances.
-# Workers have their own user_data (user_data_worker.sh) with WORKER_CONCURRENCY=20.
+# No PORT — this is a pure worker process with no HTTP listener.
+# No REDIS_ADDR — workers do not use the cache.
 cat > /opt/album-store.env <<EOF
 DATABASE_URL=${db_url}
 DATABASE_READER_URL=postgres://albumuser:${db_password}@${rds_reader_addr}:5432/albumstore
@@ -51,15 +49,12 @@ SQS_QUEUE_URL=${sqs_url}
 S3_BUCKET=${s3_bucket}
 S3_BASE_URL=${s3_base_url}
 AWS_REGION=${region}
-PORT=8080
-WORKER_CONCURRENCY=0
-REDIS_ADDR=${redis_addr}
+WORKER_CONCURRENCY=20
 EOF
 
 # ── Pull and run ──────────────────────────────────────────────────────────────
 docker pull ${ecr_repo}:latest || true
-docker run -d --name album-store \
+docker run -d --name album-store-worker \
   --env-file /opt/album-store.env \
-  -p 8080:8080 \
   --restart unless-stopped \
   ${ecr_repo}:latest
