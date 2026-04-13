@@ -58,3 +58,31 @@ func SetAlbumList(ctx context.Context, r *redis.Client, json string) {
 	}
 	r.Set(ctx, "albums:list", json, TTL)
 }
+
+// ── Photos ────────────────────────────────────────────────────────────────────
+
+// GetPhoto returns cached photo JSON and true if present.
+func GetPhoto(ctx context.Context, r *redis.Client, photoID string) (string, bool) {
+	if r == nil {
+		return "", false
+	}
+	val, err := r.Get(ctx, "photo:"+photoID).Result()
+	return val, err == nil
+}
+
+// SetPhoto caches serialised photo JSON.
+// Call this after MarkPhotoProcessed so polls bypass replica lag.
+func SetPhoto(ctx context.Context, r *redis.Client, photoID, json string) {
+	if r == nil {
+		return
+	}
+	r.Set(ctx, "photo:"+photoID, json, TTL)
+}
+
+// DeletePhoto removes the cached photo entry (called on DELETE).
+func DeletePhoto(ctx context.Context, r *redis.Client, photoID string) {
+	if r == nil {
+		return
+	}
+	r.Del(ctx, "photo:"+photoID)
+}

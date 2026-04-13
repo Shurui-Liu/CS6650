@@ -12,7 +12,9 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 
+	"album-store/internal/cache"
 	"album-store/internal/db"
 	"album-store/internal/model"
 	"album-store/internal/queue"
@@ -29,15 +31,17 @@ type PhotoHandler struct {
 	s3        *storage.Client
 	sqs       *queue.Client
 	s3Base    string
+	rdb       *redis.Client
 	uploadSem chan struct{}
 }
 
-func NewPhotoHandler(q *db.Queries, s3 *storage.Client, sqs *queue.Client, s3Base string) *PhotoHandler {
+func NewPhotoHandler(q *db.Queries, s3 *storage.Client, sqs *queue.Client, s3Base string, rdb *redis.Client) *PhotoHandler {
 	return &PhotoHandler{
 		q:         q,
 		s3:        s3,
 		sqs:       sqs,
 		s3Base:    s3Base,
+		rdb:       rdb,
 		uploadSem: make(chan struct{}, maxConcurrentUploads),
 	}
 }
@@ -54,7 +58,8 @@ func NewPhotoHandler(q *db.Queries, s3 *storage.Client, sqs *queue.Client, s3Bas
 func (h *PhotoHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	albumID := chi.URLParam(r, "albumId")
 
-	if _, err := h.q.GetAlbumPrimary(r.Context(), albumID); err != nil {
+	// Use reader pool for the existence check — saves writer connections for actual writes.
+	if _, err := h.q.GetAlbum(r.Context(), albumID); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
 		json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
@@ -135,10 +140,19 @@ func (h *PhotoHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(photo)
 
-	// S3 upload is already done; just update the DB status.
+	// S3 upload is already done; update DB status then cache the result so
+	// polling GET requests bypass replica lag.
 	go func() {
-		if err := h.q.MarkPhotoProcessed(context.Background(), photoID, publicURL); err != nil {
+		ctx := context.Background()
+		if err := h.q.MarkPhotoProcessed(ctx, photoID, publicURL); err != nil {
 			log.Printf("mark processed error (photo=%s): %v", photoID, err)
+			return
+		}
+		completed := photo
+		completed.Status = "completed"
+		completed.URL = &publicURL
+		if data, err := json.Marshal(completed); err == nil {
+			cache.SetPhoto(ctx, h.rdb, photoID, string(data))
 		}
 	}()
 }
@@ -154,6 +168,9 @@ func (h *PhotoHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Evict from cache so subsequent GETs return 404 from DB.
+	cache.DeletePhoto(r.Context(), h.rdb, photoID)
+
 	if s3Key != "" {
 		_ = h.s3.Delete(r.Context(), s3Key)
 	}
@@ -163,6 +180,14 @@ func (h *PhotoHandler) Delete(w http.ResponseWriter, r *http.Request) {
 
 func (h *PhotoHandler) Get(w http.ResponseWriter, r *http.Request) {
 	photoID := chi.URLParam(r, "photoId")
+
+	// Check Redis first — completed photos are cached here immediately after
+	// MarkPhotoProcessed, bypassing replica replication lag.
+	if cached, ok := cache.GetPhoto(r.Context(), h.rdb, photoID); ok {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(cached))
+		return
+	}
 
 	photo, err := h.q.GetPhoto(r.Context(), photoID)
 	if err != nil {

@@ -93,7 +93,7 @@ func main() {
 	r.Get("/health", handler.Health)
 
 	albumH := handler.NewAlbumHandler(queries, s3Client, rdb)
-	photoH := handler.NewPhotoHandler(queries, s3Client, sqsClient, s3Base)
+	photoH := handler.NewPhotoHandler(queries, s3Client, sqsClient, s3Base, rdb)
 
 	r.Route("/albums", func(r chi.Router) {
 		r.Get("/", albumH.List)
