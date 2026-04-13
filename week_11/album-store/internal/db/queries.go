@@ -126,6 +126,27 @@ func (q *Queries) CreatePhoto(ctx context.Context, photoID, albumID, s3Key strin
 	return p, err
 }
 
+// CreatePhotoWithSeq atomically increments the album's photo_seq and inserts
+// the photo record in a single round-trip using a CTE. This replaces the two
+// separate NextPhotoSeq + CreatePhoto calls on the upload hot path, halving
+// writer DB round-trips and reducing row-lock hold time under concurrent load.
+func (q *Queries) CreatePhotoWithSeq(ctx context.Context, photoID, albumID, s3Key string) (model.Photo, error) {
+	var p model.Photo
+	err := q.writer.QueryRow(ctx,
+		`WITH seq AS (
+		     UPDATE albums SET photo_seq = photo_seq + 1
+		     WHERE album_id = $2
+		     RETURNING photo_seq
+		 )
+		 INSERT INTO photos (photo_id, album_id, seq, s3_key, status)
+		 SELECT $1, $2, seq.photo_seq, $3, 'processing'
+		 FROM seq
+		 RETURNING photo_id, album_id, seq, status, url, created_at`,
+		photoID, albumID, s3Key,
+	).Scan(&p.PhotoID, &p.AlbumID, &p.Seq, &p.Status, &p.URL, &p.CreatedAt)
+	return p, err
+}
+
 // GetPhoto fetches a single photo by ID. Reads from replica.
 func (q *Queries) GetPhoto(ctx context.Context, photoID string) (model.Photo, error) {
 	var p model.Photo
