@@ -15,3 +15,6 @@ album-store
 # OS
 .DS_Store
 Thumbs.db
+
+.terraform/
+*.terraform.lock.hcl
