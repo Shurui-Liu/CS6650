@@ -44,7 +44,7 @@ func (c *Client) ReceiveMessages(ctx context.Context, maxMessages int32) ([]Mess
 	out, err := c.svc.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 		QueueUrl:            &c.queueURL,
 		MaxNumberOfMessages: maxMessages,
-		WaitTimeSeconds:     20, // long polling
+		WaitTimeSeconds:     1,
 	})
 	if err != nil {
 		return nil, err

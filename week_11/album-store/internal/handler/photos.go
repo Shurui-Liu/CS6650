@@ -110,14 +110,10 @@ func (h *PhotoHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(photo)
 
-	// Upload to S3 and enqueue for worker in the background.
-	msg := model.PhotoMessage{
-		PhotoID:    photoID,
-		AlbumID:    albumID,
-		Seq:        seq,
-		CurrentKey: currentKey,
-		FinalKey:   finalKey,
-	}
+	// Upload to S3 in the background, then either mark completed directly
+	// (small files already at final key) or enqueue for the worker (large
+	// files that need a tmp→final copy). This avoids SQS round-trip latency
+	// for the common case and dramatically improves POST→completed p95.
 	go func() {
 		ctx := context.Background()
 		reader := bytes.NewReader(data)
@@ -125,8 +121,25 @@ func (h *PhotoHandler) Upload(w http.ResponseWriter, r *http.Request) {
 			log.Printf("s3 upload error (key=%s): %v", currentKey, err)
 			return
 		}
-		if err := h.sqs.SendMessage(ctx, msg); err != nil {
-			log.Printf("sqs send error (photo=%s): %v", photoID, err)
+		if isLarge {
+			// Large file: worker must copy tmp/→albums/ before marking done.
+			msg := model.PhotoMessage{
+				PhotoID:    photoID,
+				AlbumID:    albumID,
+				Seq:        seq,
+				CurrentKey: currentKey,
+				FinalKey:   finalKey,
+			}
+			if err := h.sqs.SendMessage(ctx, msg); err != nil {
+				log.Printf("sqs send error (photo=%s): %v", photoID, err)
+			}
+		} else {
+			// Small file: already at final key — mark completed directly,
+			// no worker or SQS round-trip needed.
+			publicURL := fmt.Sprintf("%s/%s", h.s3Base, finalKey)
+			if err := h.q.MarkPhotoProcessed(ctx, photoID, publicURL); err != nil {
+				log.Printf("mark processed error (photo=%s): %v", photoID, err)
+			}
 		}
 	}()
 }
