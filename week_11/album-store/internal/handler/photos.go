@@ -1,12 +1,13 @@
 package handler
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"mime"
+	"mime/multipart"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -18,48 +19,80 @@ import (
 	"album-store/internal/storage"
 )
 
-const maxDirectUploadBytes = 200 * 1024 // 200 KB
+// maxConcurrentUploads caps simultaneous S3 streaming uploads.
+// Each slot uses at most one 5 MB part buffer; keeping this bounded
+// prevents memory and goroutine explosion under large concurrent load.
+const maxConcurrentUploads = 20
 
 type PhotoHandler struct {
-	q      *db.Queries
-	s3     *storage.Client
-	sqs    *queue.Client
-	s3Base string
+	q         *db.Queries
+	s3        *storage.Client
+	sqs       *queue.Client
+	s3Base    string
+	uploadSem chan struct{}
 }
 
 func NewPhotoHandler(q *db.Queries, s3 *storage.Client, sqs *queue.Client, s3Base string) *PhotoHandler {
-	return &PhotoHandler{q: q, s3: s3, sqs: sqs, s3Base: s3Base}
+	return &PhotoHandler{
+		q:         q,
+		s3:        s3,
+		sqs:       sqs,
+		s3Base:    s3Base,
+		uploadSem: make(chan struct{}, maxConcurrentUploads),
+	}
 }
 
 // Upload handles multipart/form-data photo uploads.
-// Form field: "photo" (file)
 //
 // Flow:
-//  1. Verify album exists and claim a seq number.
-//  2. Determine S3 routing: files ≤ 200 KB go to the final key directly;
-//     files > 200 KB go to tmp/{photoID} first (SQS 256 KB cap).
-//  3. Upload to S3.
-//  4. Create the photo DB row (status=processing, url=null, s3_key=finalKey).
-//  5. Send SQS message with current and final keys for the worker.
+//  1. Verify album exists and parse multipart headers.
+//  2. Claim a seq number and create the DB record (status=processing).
+//  3. Acquire the upload semaphore (caps concurrent S3 transfers).
+//  4. Stream the photo body directly to S3 — no full-body RAM buffer.
+//  5. Return 202 (body is now fully consumed; safe to respond).
+//  6. Mark the photo completed in a background goroutine (S3 is already done).
 func (h *PhotoHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	albumID := chi.URLParam(r, "albumId")
 
-	if _, err := h.q.GetAlbum(r.Context(), albumID); err != nil {
-		http.Error(w, "album not found", http.StatusNotFound)
+	if _, err := h.q.GetAlbumPrimary(r.Context(), albumID); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
 		return
 	}
 
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		http.Error(w, "failed to parse multipart form", http.StatusBadRequest)
+	_, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || params["boundary"] == "" {
+		http.Error(w, "invalid multipart content-type", http.StatusBadRequest)
 		return
 	}
 
-	file, header, err := r.FormFile("photo")
-	if err != nil {
+	mr := multipart.NewReader(r.Body, params["boundary"])
+	var part *multipart.Part
+	for {
+		p, err := mr.NextPart()
+		if err != nil {
+			break
+		}
+		if p.FormName() == "photo" {
+			part = p
+			break
+		}
+		io.Copy(io.Discard, p)
+	}
+	if part == nil {
 		http.Error(w, "photo field is required", http.StatusBadRequest)
 		return
 	}
-	defer file.Close()
+
+	filename := part.FileName()
+	if filename == "" {
+		filename = "photo"
+	}
+	fileCT := part.Header.Get("Content-Type")
+	if fileCT == "" {
+		fileCT = "application/octet-stream"
+	}
 
 	// Claim sequence number atomically.
 	seq, err := h.q.NextPhotoSeq(r.Context(), albumID)
@@ -69,77 +102,43 @@ func (h *PhotoHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	photoID := uuid.NewString()
-	finalKey := fmt.Sprintf("albums/%s/%d-%s", albumID, seq, header.Filename)
+	finalKey := fmt.Sprintf("albums/%s/%d-%s", albumID, seq, filename)
 
-	contentType := header.Header.Get("Content-Type")
-	if contentType == "" {
-		contentType = "application/octet-stream"
-	}
-
-	// Buffer the entire file into memory.
-	// ParseMultipartForm already read it (up to 32 MB); io.ReadAll just drains
-	// the remaining bytes. Using bytes.Reader gives the SDK a seekable body with
-	// a known length, which is required for S3 PutObject.
-	data, err := io.ReadAll(file)
-	if err != nil {
-		http.Error(w, "failed to read file", http.StatusInternalServerError)
-		return
-	}
-
-	isLarge := len(data) > maxDirectUploadBytes
-
-	var currentKey string
-	if isLarge {
-		// Large file: stage in tmp/ first so the SQS message stays under 256 KB.
-		// Worker will copy it to the final key.
-		currentKey = fmt.Sprintf("tmp/%s", photoID)
-	} else {
-		currentKey = finalKey
-	}
-
-	// Create DB record synchronously so GET /photos/{photoId} returns 200
-	// with status="processing" immediately after the 202 response.
 	photo, err := h.q.CreatePhoto(r.Context(), photoID, albumID, finalKey, seq)
 	if err != nil {
 		http.Error(w, "failed to create photo record", http.StatusInternalServerError)
 		return
 	}
 
-	// Return 202 immediately — do not block on S3 upload.
+	// Acquire semaphore before touching S3. Released when this handler returns.
+	// Prevents unbounded concurrent large uploads from exhausting memory/goroutines.
+	select {
+	case h.uploadSem <- struct{}{}:
+		defer func() { <-h.uploadSem }()
+	case <-r.Context().Done():
+		io.Copy(io.Discard, r.Body)
+		http.Error(w, "request cancelled", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Stream the multipart part directly to S3 in 5 MB chunks — peak memory
+	// per upload is one chunk, regardless of total file size.
+	publicURL, err := h.s3.UploadStream(r.Context(), finalKey, fileCT, part)
+	if err != nil {
+		log.Printf("s3 stream upload error (key=%s): %v", finalKey, err)
+		http.Error(w, "failed to upload photo", http.StatusInternalServerError)
+		return
+	}
+
+	// Body fully consumed — safe to respond 202.
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(photo)
 
-	// Upload to S3 in the background, then either mark completed directly
-	// (small files already at final key) or enqueue for the worker (large
-	// files that need a tmp→final copy). This avoids SQS round-trip latency
-	// for the common case and dramatically improves POST→completed p95.
+	// S3 upload is already done; just update the DB status.
 	go func() {
-		ctx := context.Background()
-		reader := bytes.NewReader(data)
-		if _, err := h.s3.Upload(ctx, currentKey, contentType, reader, int64(len(data))); err != nil {
-			log.Printf("s3 upload error (key=%s): %v", currentKey, err)
-			return
-		}
-		if isLarge {
-			// Large file: worker must copy tmp/→albums/ before marking done.
-			msg := model.PhotoMessage{
-				PhotoID:    photoID,
-				AlbumID:    albumID,
-				Seq:        seq,
-				CurrentKey: currentKey,
-				FinalKey:   finalKey,
-			}
-			if err := h.sqs.SendMessage(ctx, msg); err != nil {
-				log.Printf("sqs send error (photo=%s): %v", photoID, err)
-			}
-		} else {
-			// Small file: already at final key — mark completed directly,
-			// no worker or SQS round-trip needed.
-			publicURL := fmt.Sprintf("%s/%s", h.s3Base, finalKey)
-			if err := h.q.MarkPhotoProcessed(ctx, photoID, publicURL); err != nil {
-				log.Printf("mark processed error (photo=%s): %v", photoID, err)
-			}
+		if err := h.q.MarkPhotoProcessed(context.Background(), photoID, publicURL); err != nil {
+			log.Printf("mark processed error (photo=%s): %v", photoID, err)
 		}
 	}()
 }
@@ -155,7 +154,6 @@ func (h *PhotoHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Best-effort S3 cleanup — don't fail the request if S3 delete errors.
 	if s3Key != "" {
 		_ = h.s3.Delete(r.Context(), s3Key)
 	}

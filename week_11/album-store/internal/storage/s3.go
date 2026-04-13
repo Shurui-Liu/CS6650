@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
@@ -37,6 +38,27 @@ func (c *Client) Upload(ctx context.Context, key, contentType string, r io.Reade
 	})
 	if err != nil {
 		return "", fmt.Errorf("s3 put: %w", err)
+	}
+	return fmt.Sprintf("%s/%s", c.baseURL, key), nil
+}
+
+// UploadStream uploads r to S3 under key using multipart upload.
+// Unlike Upload, it does not require the caller to know the content length and
+// never buffers the entire body in memory — it reads and uploads in 5 MB chunks.
+// Use this for large or unknown-size payloads.
+func (c *Client) UploadStream(ctx context.Context, key, contentType string, r io.Reader) (string, error) {
+	uploader := manager.NewUploader(c.svc, func(u *manager.Uploader) {
+		u.PartSize = 5 * 1024 * 1024 // 5 MB per part
+		u.Concurrency = 1            // sequential parts — one goroutine per upload
+	})
+	_, err := uploader.Upload(ctx, &s3.PutObjectInput{
+		Bucket:      &c.bucket,
+		Key:         &key,
+		Body:        r,
+		ContentType: aws.String(contentType),
+	})
+	if err != nil {
+		return "", fmt.Errorf("s3 upload stream: %w", err)
 	}
 	return fmt.Sprintf("%s/%s", c.baseURL, key), nil
 }

@@ -108,11 +108,11 @@ func main() {
 	})
 
 	srv := &http.Server{
-		Addr:         fmt.Sprintf(":%s", port),
-		Handler:      r,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		Addr:              fmt.Sprintf(":%s", port),
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second, // limit header read only; body read is handler's responsibility
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	go func() {

@@ -49,6 +49,17 @@ func (q *Queries) UpsertAlbum(ctx context.Context, albumID string, r model.Creat
 	return a, err
 }
 
+// GetAlbumPrimary reads from the primary writer — use in write paths to avoid replica lag.
+func (q *Queries) GetAlbumPrimary(ctx context.Context, albumID string) (model.Album, error) {
+	var a model.Album
+	err := q.writer.QueryRow(ctx,
+		`SELECT album_id, title, description, owner, photo_seq, created_at
+		 FROM albums WHERE album_id = $1`,
+		albumID,
+	).Scan(&a.AlbumID, &a.Title, &a.Description, &a.Owner, &a.PhotoSeq, &a.CreatedAt)
+	return a, err
+}
+
 // GetAlbum reads from the replica — SELECT only.
 func (q *Queries) GetAlbum(ctx context.Context, albumID string) (model.Album, error) {
 	var a model.Album
