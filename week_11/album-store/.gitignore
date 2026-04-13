@@ -1,0 +1,17 @@
+# Secrets — never commit
+*.tfvars
+*.tfvars.json
+.env
+
+# Terraform state
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
+
+# Go build output
+album-store
+
+# OS
+.DS_Store
+Thumbs.db

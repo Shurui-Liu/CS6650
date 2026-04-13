@@ -304,16 +304,14 @@ resource "aws_launch_template" "api" {
   vpc_security_group_ids = [aws_security_group.ec2.id]
 
   user_data = base64encode(templatefile("${path.module}/user_data.sh", {
-    ecr_repo        = aws_ecr_repository.app.repository_url
-    region          = var.region
-    db_url          = "postgres://albumuser:${var.db_password}@127.0.0.1:5432/albumstore"
-    sqs_url         = aws_sqs_queue.photos.url
-    s3_bucket       = aws_s3_bucket.photos.bucket
-    s3_base_url     = "https://${aws_s3_bucket.photos.bucket}.s3.${var.region}.amazonaws.com"
-    redis_addr      = "${aws_elasticache_cluster.redis.cache_nodes[0].address}:6379"
-    rds_host        = aws_db_instance.postgres.address
-    db_password     = var.db_password
-    rds_reader_addr = aws_db_instance.postgres_replica.address
+    ecr_repo       = aws_ecr_repository.app.repository_url
+    region         = var.region
+    db_url         = "postgres://albumuser:${var.db_password}@${aws_db_instance.postgres.address}:5432/albumstore"
+    db_reader_url  = "postgres://albumuser:${var.db_password}@${aws_db_instance.postgres_replica.address}:5432/albumstore"
+    sqs_url        = aws_sqs_queue.photos.url
+    s3_bucket      = aws_s3_bucket.photos.bucket
+    s3_base_url    = "https://${aws_s3_bucket.photos.bucket}.s3.${var.region}.amazonaws.com"
+    redis_addr     = "${aws_elasticache_cluster.redis.cache_nodes[0].address}:6379"
   }))
 
   tag_specifications {
@@ -404,15 +402,13 @@ resource "aws_launch_template" "worker" {
   vpc_security_group_ids = [aws_security_group.ec2.id]
 
   user_data = base64encode(templatefile("${path.module}/user_data_worker.sh", {
-    ecr_repo        = aws_ecr_repository.app.repository_url
-    region          = var.region
-    db_url          = "postgres://albumuser:${var.db_password}@127.0.0.1:5432/albumstore"
-    sqs_url         = aws_sqs_queue.photos.url
-    s3_bucket       = aws_s3_bucket.photos.bucket
-    s3_base_url     = "https://${aws_s3_bucket.photos.bucket}.s3.${var.region}.amazonaws.com"
-    rds_host        = aws_db_instance.postgres.address
-    db_password     = var.db_password
-    rds_reader_addr = aws_db_instance.postgres_replica.address
+    ecr_repo      = aws_ecr_repository.app.repository_url
+    region        = var.region
+    db_url        = "postgres://albumuser:${var.db_password}@${aws_db_instance.postgres.address}:5432/albumstore"
+    db_reader_url = "postgres://albumuser:${var.db_password}@${aws_db_instance.postgres_replica.address}:5432/albumstore"
+    sqs_url       = aws_sqs_queue.photos.url
+    s3_bucket     = aws_s3_bucket.photos.bucket
+    s3_base_url   = "https://${aws_s3_bucket.photos.bucket}.s3.${var.region}.amazonaws.com"
   }))
 
   tag_specifications {
