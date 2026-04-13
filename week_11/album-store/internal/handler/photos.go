@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -70,48 +71,46 @@ func (h *PhotoHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	photoID := uuid.NewString()
 	finalKey := fmt.Sprintf("albums/%s/%d-%s", albumID, seq, header.Filename)
 
-	// Peek at the first maxDirectUploadBytes+1 bytes to determine routing.
-	peek := make([]byte, maxDirectUploadBytes+1)
-	n, _ := io.ReadFull(file, peek)
-	isLarge := n > maxDirectUploadBytes
-
 	contentType := header.Header.Get("Content-Type")
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
 
-	var currentKey string
-	var reader io.Reader
-	var uploadSize int64
-	if isLarge {
-		// Large file: stage in tmp/, worker will move it to the final key.
-		// Use io.MultiReader to replay the peeked bytes then stream the rest.
-		// header.Size is the exact multipart field size — required by the SDK
-		// because io.MultiReader is not seekable.
-		currentKey = fmt.Sprintf("tmp/%s", photoID)
-		reader = io.MultiReader(bytes.NewReader(peek[:n]), file)
-		uploadSize = header.Size
-	} else {
-		// Small file: all bytes already in peek[:n]; use bytes.NewReader so the
-		// SDK can seek it and determine length without an explicit ContentLength.
-		currentKey = finalKey
-		reader = bytes.NewReader(peek[:n])
-		uploadSize = int64(n)
-	}
-
-	if _, err := h.s3.Upload(r.Context(), currentKey, contentType, reader, uploadSize); err != nil {
-		log.Printf("s3 upload error (key=%s): %v", currentKey, err)
-		http.Error(w, "failed to upload photo", http.StatusInternalServerError)
+	// Buffer the entire file into memory.
+	// ParseMultipartForm already read it (up to 32 MB); io.ReadAll just drains
+	// the remaining bytes. Using bytes.Reader gives the SDK a seekable body with
+	// a known length, which is required for S3 PutObject.
+	data, err := io.ReadAll(file)
+	if err != nil {
+		http.Error(w, "failed to read file", http.StatusInternalServerError)
 		return
 	}
 
-	// Store the final key in DB so DELETE can clean up S3 correctly.
+	isLarge := len(data) > maxDirectUploadBytes
+
+	var currentKey string
+	if isLarge {
+		// Large file: stage in tmp/ first so the SQS message stays under 256 KB.
+		// Worker will copy it to the final key.
+		currentKey = fmt.Sprintf("tmp/%s", photoID)
+	} else {
+		currentKey = finalKey
+	}
+
+	// Create DB record synchronously so GET /photos/{photoId} returns 200
+	// with status="processing" immediately after the 202 response.
 	photo, err := h.q.CreatePhoto(r.Context(), photoID, albumID, finalKey, seq)
 	if err != nil {
 		http.Error(w, "failed to create photo record", http.StatusInternalServerError)
 		return
 	}
 
+	// Return 202 immediately — do not block on S3 upload.
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(photo)
+
+	// Upload to S3 and enqueue for worker in the background.
 	msg := model.PhotoMessage{
 		PhotoID:    photoID,
 		AlbumID:    albumID,
@@ -119,14 +118,17 @@ func (h *PhotoHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		CurrentKey: currentKey,
 		FinalKey:   finalKey,
 	}
-	if err := h.sqs.SendMessage(r.Context(), msg); err != nil {
-		// Non-fatal: worker will reconcile.
-		_ = err
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusAccepted) // 202 — processing is async
-	json.NewEncoder(w).Encode(photo)
+	go func() {
+		ctx := context.Background()
+		reader := bytes.NewReader(data)
+		if _, err := h.s3.Upload(ctx, currentKey, contentType, reader, int64(len(data))); err != nil {
+			log.Printf("s3 upload error (key=%s): %v", currentKey, err)
+			return
+		}
+		if err := h.sqs.SendMessage(ctx, msg); err != nil {
+			log.Printf("sqs send error (photo=%s): %v", photoID, err)
+		}
+	}()
 }
 
 func (h *PhotoHandler) Delete(w http.ResponseWriter, r *http.Request) {
