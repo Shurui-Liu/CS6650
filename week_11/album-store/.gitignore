@@ -16,5 +16,8 @@ album-store
 .DS_Store
 Thumbs.db
 
+# Docker
+Dockerfile
+
 .terraform/
 *.terraform.lock.hcl
