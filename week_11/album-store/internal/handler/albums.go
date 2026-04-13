@@ -90,7 +90,9 @@ func (h *AlbumHandler) Get(w http.ResponseWriter, r *http.Request) {
 
 	album, err := h.q.GetAlbum(r.Context(), albumID)
 	if err != nil {
-		http.Error(w, "album not found", http.StatusNotFound)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
 		return
 	}
 

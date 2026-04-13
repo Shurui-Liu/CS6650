@@ -124,13 +124,28 @@ func (h *PhotoHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		_ = err
 	}
 
-	// Return the expected final URL in the response.
-	finalURL := fmt.Sprintf("%s/%s", h.s3Base, finalKey)
-	photo.URL = &finalURL
-
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted) // 202 — processing is async
 	json.NewEncoder(w).Encode(photo)
+}
+
+func (h *PhotoHandler) Delete(w http.ResponseWriter, r *http.Request) {
+	photoID := chi.URLParam(r, "photoId")
+
+	s3Key, err := h.q.DeletePhoto(r.Context(), photoID)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+		return
+	}
+
+	// Best-effort S3 cleanup — don't fail the request if S3 delete errors.
+	if s3Key != "" {
+		_ = h.s3.Delete(r.Context(), s3Key)
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *PhotoHandler) Get(w http.ResponseWriter, r *http.Request) {
@@ -138,7 +153,9 @@ func (h *PhotoHandler) Get(w http.ResponseWriter, r *http.Request) {
 
 	photo, err := h.q.GetPhoto(r.Context(), photoID)
 	if err != nil {
-		http.Error(w, "photo not found", http.StatusNotFound)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
 		return
 	}
 

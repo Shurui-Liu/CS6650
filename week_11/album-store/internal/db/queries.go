@@ -181,6 +181,16 @@ func (q *Queries) ListPhotoS3Keys(ctx context.Context, albumID string) ([]string
 	return keys, rows.Err()
 }
 
+// DeletePhoto removes a single photo row and returns its s3_key for cleanup.
+func (q *Queries) DeletePhoto(ctx context.Context, photoID string) (string, error) {
+	var s3Key string
+	err := q.writer.QueryRow(ctx,
+		`DELETE FROM photos WHERE photo_id = $1 RETURNING s3_key`,
+		photoID,
+	).Scan(&s3Key)
+	return s3Key, err
+}
+
 // DeletePhotosForAlbum removes all photo rows for an album.
 func (q *Queries) DeletePhotosForAlbum(ctx context.Context, albumID string) error {
 	_, err := q.writer.Exec(ctx, `DELETE FROM photos WHERE album_id = $1`, albumID)

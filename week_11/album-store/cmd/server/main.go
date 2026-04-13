@@ -104,6 +104,7 @@ func main() {
 		r.Post("/{albumId}/photos", photoH.Upload)
 		r.Get("/{albumId}/photos", photoH.List)
 		r.Get("/{albumId}/photos/{photoId}", photoH.Get)
+		r.Delete("/{albumId}/photos/{photoId}", photoH.Delete)
 	})
 
 	srv := &http.Server{
