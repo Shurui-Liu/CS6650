@@ -27,8 +27,10 @@ EOF
 
 # ── Pull and run ──────────────────────────────────────────────────────────────
 docker pull ${ecr_repo}:latest || true
+# --network host lets the container reach the EC2 instance metadata service
+# (IMDSv2 hop limit issue prevents credential lookup inside bridged containers).
 docker run -d --name album-store \
   --env-file /opt/album-store.env \
-  -p 8080:8080 \
+  --network host \
   --restart unless-stopped \
   ${ecr_repo}:latest

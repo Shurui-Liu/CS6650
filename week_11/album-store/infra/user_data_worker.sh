@@ -27,5 +27,6 @@ EOF
 docker pull ${ecr_repo}:latest || true
 docker run -d --name album-store-worker \
   --env-file /opt/album-store.env \
+  --network host \
   --restart unless-stopped \
   ${ecr_repo}:latest

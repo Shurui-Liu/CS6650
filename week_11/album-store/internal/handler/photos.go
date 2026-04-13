@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -74,22 +75,32 @@ func (h *PhotoHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	n, _ := io.ReadFull(file, peek)
 	isLarge := n > maxDirectUploadBytes
 
-	// Reconstruct a reader from peeked bytes + remainder.
-	reader := io.MultiReader(bytes.NewReader(peek[:n]), file)
-
-	var currentKey string
-	if isLarge {
-		currentKey = fmt.Sprintf("tmp/%s", photoID)
-	} else {
-		currentKey = finalKey
-	}
-
 	contentType := header.Header.Get("Content-Type")
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
 
-	if _, err := h.s3.Upload(r.Context(), currentKey, contentType, reader); err != nil {
+	var currentKey string
+	var reader io.Reader
+	var uploadSize int64
+	if isLarge {
+		// Large file: stage in tmp/, worker will move it to the final key.
+		// Use io.MultiReader to replay the peeked bytes then stream the rest.
+		// header.Size is the exact multipart field size — required by the SDK
+		// because io.MultiReader is not seekable.
+		currentKey = fmt.Sprintf("tmp/%s", photoID)
+		reader = io.MultiReader(bytes.NewReader(peek[:n]), file)
+		uploadSize = header.Size
+	} else {
+		// Small file: all bytes already in peek[:n]; use bytes.NewReader so the
+		// SDK can seek it and determine length without an explicit ContentLength.
+		currentKey = finalKey
+		reader = bytes.NewReader(peek[:n])
+		uploadSize = int64(n)
+	}
+
+	if _, err := h.s3.Upload(r.Context(), currentKey, contentType, reader, uploadSize); err != nil {
+		log.Printf("s3 upload error (key=%s): %v", currentKey, err)
 		http.Error(w, "failed to upload photo", http.StatusInternalServerError)
 		return
 	}
@@ -118,7 +129,20 @@ func (h *PhotoHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	photo.URL = &finalURL
 
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
+	w.WriteHeader(http.StatusAccepted) // 202 — processing is async
+	json.NewEncoder(w).Encode(photo)
+}
+
+func (h *PhotoHandler) Get(w http.ResponseWriter, r *http.Request) {
+	photoID := chi.URLParam(r, "photoId")
+
+	photo, err := h.q.GetPhoto(r.Context(), photoID)
+	if err != nil {
+		http.Error(w, "photo not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(photo)
 }
 

@@ -25,12 +25,15 @@ func New(cfg aws.Config, bucket, baseURL string) *Client {
 }
 
 // Upload streams r to S3 under key and returns the public URL.
-func (c *Client) Upload(ctx context.Context, key, contentType string, r io.Reader) (string, error) {
+// contentLength must be the exact byte size of r; the AWS SDK requires it
+// when the body is a non-seekable io.Reader (e.g. io.MultiReader).
+func (c *Client) Upload(ctx context.Context, key, contentType string, r io.Reader, contentLength int64) (string, error) {
 	_, err := c.svc.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:      &c.bucket,
-		Key:         &key,
-		Body:        r,
-		ContentType: aws.String(contentType),
+		Bucket:        &c.bucket,
+		Key:           &key,
+		Body:          r,
+		ContentType:   aws.String(contentType),
+		ContentLength: aws.Int64(contentLength),
 	})
 	if err != nil {
 		return "", fmt.Errorf("s3 put: %w", err)

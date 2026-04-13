@@ -115,6 +115,17 @@ func (q *Queries) CreatePhoto(ctx context.Context, photoID, albumID, s3Key strin
 	return p, err
 }
 
+// GetPhoto fetches a single photo by ID. Reads from replica.
+func (q *Queries) GetPhoto(ctx context.Context, photoID string) (model.Photo, error) {
+	var p model.Photo
+	err := q.reader.QueryRow(ctx,
+		`SELECT photo_id, album_id, seq, status, url, created_at
+		 FROM photos WHERE photo_id = $1`,
+		photoID,
+	).Scan(&p.PhotoID, &p.AlbumID, &p.Seq, &p.Status, &p.URL, &p.CreatedAt)
+	return p, err
+}
+
 // ListPhotos reads from the replica.
 func (q *Queries) ListPhotos(ctx context.Context, albumID string) ([]model.Photo, error) {
 	rows, err := q.reader.Query(ctx,
@@ -138,10 +149,10 @@ func (q *Queries) ListPhotos(ctx context.Context, albumID string) ([]model.Photo
 	return photos, rows.Err()
 }
 
-// MarkPhotoProcessed sets status='processed' and the public S3 URL.
+// MarkPhotoProcessed sets status='completed' and the public S3 URL.
 func (q *Queries) MarkPhotoProcessed(ctx context.Context, photoID, url string) error {
 	_, err := q.writer.Exec(ctx,
-		`UPDATE photos SET status = 'processed', url = $2 WHERE photo_id = $1`,
+		`UPDATE photos SET status = 'completed', url = $2 WHERE photo_id = $1`,
 		photoID, url,
 	)
 	return err
